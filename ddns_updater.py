@@ -26,7 +26,7 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/data/config.json"))
 
@@ -214,6 +214,7 @@ let domains = [];
 let interval = 300;
 let records = [];
 let savedRecordIds = [];
+let savedRecordLabels = {};
 
 async function loadConfig() {
   try {
@@ -221,6 +222,7 @@ async function loadConfig() {
     const cfg = await resp.json();
     domains = cfg.domains || [];
     savedRecordIds = cfg.record_ids || [];
+    savedRecordLabels = cfg.record_labels || {};
     interval = cfg.update_interval || 300;
     document.getElementById('intervalInput').value = interval;
     renderDomains();
@@ -303,6 +305,13 @@ async function saveSelection() {
   const ids = Array.from(checks).map(c => c.value);
   interval = parseInt(document.getElementById('intervalInput').value) || 300;
 
+  // Build labels map for selected records
+  const labels = {};
+  ids.forEach(id => {
+    const r = records.find(x => x.record_id === id);
+    if (r) labels[id] = (r.name || '@') + '.' + r.zone;
+  });
+
   try {
     const resp = await fetch('/api/config', {
       method: 'POST',
@@ -310,6 +319,7 @@ async function saveSelection() {
       body: JSON.stringify({
         domains: domains,
         record_ids: ids,
+        record_labels: labels,
         update_interval: interval
       })
     });
@@ -334,7 +344,7 @@ function showStatus() {
   let html = '<p class="section-label">Aktive Records (Update alle ' + interval + 's):</p>';
   savedRecordIds.forEach(id => {
     const r = records.find(x => x.record_id === id);
-    const label = r ? (r.name || '@') + '.' + r.zone : 'Record #' + id;
+    const label = r ? (r.name || '@') + '.' + r.zone : (savedRecordLabels[id] || 'Record #' + id);
     html += '<span class="badge badge-active" style="margin:2px">' + esc(label) + '</span> ';
   });
   div.innerHTML = html;
@@ -553,6 +563,8 @@ def set_config():
         cfg["domains"] = [d.strip().lower() for d in data["domains"] if d.strip()]
     if "record_ids" in data:
         cfg["record_ids"] = data["record_ids"]
+    if "record_labels" in data:
+        cfg["record_labels"] = data["record_labels"]
     if "update_interval" in data:
         cfg["update_interval"] = max(60, int(data["update_interval"]))
 
