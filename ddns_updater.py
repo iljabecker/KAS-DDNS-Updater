@@ -26,7 +26,7 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/data/config.json"))
 

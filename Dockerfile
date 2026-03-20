@@ -13,7 +13,7 @@ COPY ddns_updater.py .
 EXPOSE 8000
 
 # Run as non-root
-RUN useradd -r -s /bin/false ddns
+RUN useradd -r -s /bin/false ddns && mkdir -p /data && chown ddns /data
 USER ddns
 
 CMD ["python", "-u", "ddns_updater.py"]
