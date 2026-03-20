@@ -405,11 +405,21 @@ def get_public_ip() -> str:
 
 
 def kas_auth(login: str, password: str) -> str:
-    auth_data = hashlib.sha1(password.encode()).hexdigest()
+    # Try sha1 first, fall back to plain if disabled
+    for auth_type, auth_val in [
+        ("sha1", hashlib.sha1(password.encode()).hexdigest()),
+        ("plain", password),
+    ]:
+        token = _try_auth(login, auth_type, auth_val)
+        if token:
+            return token
+    raise RuntimeError("KAS authentication failed with both sha1 and plain")
 
+
+def _try_auth(login: str, auth_type: str, auth_data: str) -> str | None:
     params_json = json.dumps({
         "KasUser": login,
-        "KasAuthType": "sha1",
+        "KasAuthType": auth_type,
         "KasAuthData": auth_data,
     })
 
@@ -436,8 +446,17 @@ def kas_auth(login: str, password: str) -> str:
         },
         timeout=30,
     )
-    resp.raise_for_status()
-    return _parse_auth_token(resp.text)
+    if resp.status_code != 200:
+        log.warning("Auth with %s failed: HTTP %d", auth_type, resp.status_code)
+        return None
+    if "Fault" in resp.text:
+        log.warning("Auth with %s failed: %s", auth_type, resp.text[:200])
+        return None
+    try:
+        return _parse_auth_token(resp.text)
+    except RuntimeError:
+        log.warning("Auth with %s: could not parse token", auth_type)
+        return None
 
 
 def _parse_auth_token(xml_text: str) -> str:
@@ -587,47 +606,15 @@ def api_debug():
         return jsonify({"error": "Missing login, password or domain"}), 400
 
     try:
-        # Debug: show raw auth response too
-        auth_data = hashlib.sha1(password.encode()).hexdigest()
-        auth_params = json.dumps({
-            "KasUser": login,
-            "KasAuthType": "sha1",
-            "KasAuthData": auth_data,
-        })
-        auth_soap = f"""<?xml version="1.0" encoding="UTF-8"?>
-<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:ns1="urn:xmethodsKasApi"
-  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
-  SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-  <SOAP-ENV:Body>
-    <ns1:KasAuth>
-      <Params xsi:type="xsd:string">{auth_params}</Params>
-    </ns1:KasAuth>
-  </SOAP-ENV:Body>
-</SOAP-ENV:Envelope>"""
-
-        auth_resp = requests.post(
-            KAS_AUTH_URL,
-            data=auth_soap.encode("utf-8"),
-            headers={
-                "Content-Type": "text/xml; charset=utf-8",
-                "SOAPAction": "urn:xmethodsKasApi#KasAuth",
-            },
-            timeout=30,
-        )
-        auth_xml = auth_resp.text
-        token = _parse_auth_token(auth_xml)
-
+        token = kas_auth(login, password)
         parts = domain.split(".")
         zone = ".".join(parts[-2:]) + "." if len(parts) >= 2 else domain + "."
         time.sleep(3)
         xml = kas_api_call(token, login, "get_dns_settings", {"zone_host": zone})
         return jsonify({
             "zone": zone,
-            "auth_raw": auth_xml[:3000],
-            "token_parsed": token[:20] + "..." if len(token) > 20 else token,
+            "auth": "ok",
+            "token_preview": token[:10] + "...",
             "raw_xml": xml[:5000],
             "parsed": parse_dns_records(xml),
         })
