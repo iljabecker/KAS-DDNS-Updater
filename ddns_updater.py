@@ -1,15 +1,17 @@
 """KAS DDNS Updater - Updates ALL-INKL DNS A-Records with current public IP."""
 
 import hashlib
+import json
 import logging
 import os
 import sys
 import threading
 import time
+from pathlib import Path
 from xml.etree import ElementTree
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request as flask_request
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -21,7 +23,6 @@ log = logging.getLogger("kas-ddns")
 KAS_AUTH_URL = "https://kasapi.kasserver.com/soap/KasAuth.php"
 KAS_API_URL = "https://kasapi.kasserver.com/soap/KasApi.php"
 
-# IP lookup services (fallback chain)
 IP_SERVICES = [
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
@@ -29,7 +30,23 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/data/config.json"))
+
 app = Flask(__name__)
+
+
+# ── Config Persistence ───────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        return json.loads(CONFIG_PATH.read_text())
+    return {"domains": [], "record_ids": [], "update_interval": 300}
+
+
+def save_config(cfg: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
 
 # ── HTML Web UI ──────────────────────────────────────────────────────────────
 
@@ -43,122 +60,289 @@ HTML_PAGE = """<!DOCTYPE html>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
          background: #0f172a; color: #e2e8f0; min-height: 100vh;
-         display: flex; align-items: center; justify-content: center; }
-  .container { max-width: 720px; width: 100%; padding: 2rem; }
-  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
-  .subtitle { color: #94a3b8; margin-bottom: 2rem; font-size: 0.9rem; }
+         padding: 2rem; }
+  .container { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  .subtitle { color: #94a3b8; margin-bottom: 1.5rem; font-size: 0.9rem; }
   .card { background: #1e293b; border-radius: 12px; padding: 1.5rem;
           border: 1px solid #334155; margin-bottom: 1rem; }
-  .btn { background: #3b82f6; color: #fff; border: none; padding: 0.75rem 1.5rem;
-         border-radius: 8px; font-size: 1rem; cursor: pointer; width: 100%;
+  .card h2 { font-size: 1.1rem; margin-bottom: 1rem; }
+  .btn { background: #3b82f6; color: #fff; border: none; padding: 0.6rem 1.2rem;
+         border-radius: 8px; font-size: 0.9rem; cursor: pointer;
          transition: background 0.2s; }
   .btn:hover { background: #2563eb; }
   .btn:disabled { background: #475569; cursor: not-allowed; }
-  .spinner { display: inline-block; width: 18px; height: 18px;
+  .btn-sm { padding: 0.4rem 0.8rem; font-size: 0.8rem; }
+  .btn-red { background: #dc2626; }
+  .btn-red:hover { background: #b91c1c; }
+  .btn-green { background: #16a34a; }
+  .btn-green:hover { background: #15803d; }
+  .btn-full { width: 100%; }
+  .spinner { display: inline-block; width: 16px; height: 16px;
              border: 2px solid #fff; border-top-color: transparent;
              border-radius: 50%; animation: spin 0.8s linear infinite;
-             vertical-align: middle; margin-right: 8px; }
+             vertical-align: middle; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .result { margin-top: 1.5rem; display: none; }
-  .result.show { display: block; }
+  .input-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+  input[type="text"], input[type="number"] {
+    background: #0f172a; border: 1px solid #334155; color: #e2e8f0;
+    padding: 0.6rem 0.75rem; border-radius: 8px; font-size: 0.9rem;
+    flex: 1; outline: none; }
+  input:focus { border-color: #3b82f6; }
+  .domain-list { list-style: none; }
+  .domain-list li { display: flex; align-items: center; justify-content: space-between;
+                     padding: 0.5rem 0.75rem; background: #0f172a; border-radius: 8px;
+                     margin-bottom: 0.5rem; font-family: monospace; font-size: 0.9rem; }
   .ip-box { background: #0f172a; border-radius: 8px; padding: 1rem;
             margin-bottom: 1rem; display: flex; justify-content: space-between;
             align-items: center; }
   .ip-label { color: #94a3b8; font-size: 0.85rem; }
   .ip-value { font-family: monospace; font-size: 1.1rem; color: #22c55e; }
   table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
-  th { text-align: left; padding: 0.6rem 0.75rem; color: #94a3b8;
-       font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;
+  th { text-align: left; padding: 0.5rem 0.6rem; color: #94a3b8;
+       font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
        border-bottom: 1px solid #334155; }
-  td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #1e293b;
-       font-size: 0.9rem; }
+  td { padding: 0.5rem 0.6rem; border-bottom: 1px solid #1e293b; font-size: 0.85rem; }
   tr:hover td { background: #1e293b; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px;
            font-size: 0.75rem; font-weight: 600; }
   .badge-ok { background: #14532d; color: #4ade80; }
   .badge-update { background: #7c2d12; color: #fb923c; }
+  .badge-active { background: #1e3a5f; color: #60a5fa; }
   .error { background: #7f1d1d; border: 1px solid #991b1b; border-radius: 8px;
-           padding: 1rem; color: #fca5a5; margin-top: 1rem; display: none; }
+           padding: 1rem; color: #fca5a5; margin-bottom: 1rem; display: none; }
   .error.show { display: block; }
+  .success { background: #14532d; border: 1px solid #166534; border-radius: 8px;
+             padding: 1rem; color: #4ade80; margin-bottom: 1rem; display: none; }
+  .success.show { display: block; }
+  .hidden { display: none; }
+  .section-label { color: #94a3b8; font-size: 0.8rem; margin-bottom: 0.5rem; }
+  .interval-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
+  .interval-row label { color: #94a3b8; font-size: 0.85rem; white-space: nowrap; }
+  .interval-row input { width: 100px; }
+  .check-col { width: 40px; text-align: center; }
+  input[type="checkbox"] { width: 18px; height: 18px; accent-color: #3b82f6; cursor: pointer; }
 </style>
 </head>
 <body>
 <div class="container">
   <h1>KAS DDNS Updater</h1>
-  <p class="subtitle">Verbindung testen und DNS A-Records pruefen</p>
-  <div class="card">
-    <button class="btn" id="testBtn" onclick="testConnection()">
-      Verbindung testen
-    </button>
-  </div>
+  <p class="subtitle">DNS A-Records automatisch aktualisieren</p>
+
   <div class="error" id="error"></div>
-  <div class="result" id="result">
-    <div class="card">
-      <div class="ip-box">
-        <div>
-          <div class="ip-label">Deine aktuelle oeffentliche IP</div>
-          <div class="ip-value" id="currentIp">—</div>
-        </div>
-      </div>
-      <h3 style="margin-bottom:0.5rem; font-size:1rem;">A-Records</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>Record</th>
-            <th>Zone</th>
-            <th>Aktuelle IP</th>
-            <th>ID</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody id="recordsBody"></tbody>
-      </table>
+  <div class="success" id="success"></div>
+
+  <!-- Step 1: Domain Management -->
+  <div class="card">
+    <h2>1. Domains verwalten</h2>
+    <div class="input-row">
+      <input type="text" id="domainInput" placeholder="z.B. example.de" onkeydown="if(event.key==='Enter')addDomain()">
+      <button class="btn btn-sm" onclick="addDomain()">Hinzufuegen</button>
+    </div>
+    <ul class="domain-list" id="domainList"></ul>
+    <div class="interval-row">
+      <label>Update-Intervall:</label>
+      <input type="number" id="intervalInput" min="60" step="60" value="300">
+      <label>Sekunden</label>
     </div>
   </div>
+
+  <!-- Step 2: Test Connection -->
+  <div class="card">
+    <h2>2. Verbindung testen</h2>
+    <button class="btn btn-full" id="testBtn" onclick="testConnection()">
+      Verbindung testen &amp; A-Records laden
+    </button>
+  </div>
+
+  <!-- Step 3: Select Records -->
+  <div class="card hidden" id="recordsCard">
+    <h2>3. A-Records auswaehlen</h2>
+    <div class="ip-box">
+      <div>
+        <div class="ip-label">Deine aktuelle oeffentliche IP</div>
+        <div class="ip-value" id="currentIp">-</div>
+      </div>
+    </div>
+    <p class="section-label">Waehle die Records, die automatisch aktualisiert werden sollen:</p>
+    <table>
+      <thead>
+        <tr>
+          <th class="check-col"></th>
+          <th>Record</th>
+          <th>Zone</th>
+          <th>Aktuelle IP</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="recordsBody"></tbody>
+    </table>
+    <div style="margin-top:1rem;">
+      <button class="btn btn-green btn-full" onclick="saveSelection()">
+        Auswahl speichern &amp; DDNS aktivieren
+      </button>
+    </div>
+  </div>
+
+  <!-- Status -->
+  <div class="card hidden" id="statusCard">
+    <h2>Status</h2>
+    <div id="activeRecords"></div>
+  </div>
 </div>
+
 <script>
+let domains = [];
+let interval = 300;
+let records = [];
+let savedRecordIds = [];
+
+async function loadConfig() {
+  try {
+    const resp = await fetch('/api/config');
+    const cfg = await resp.json();
+    domains = cfg.domains || [];
+    savedRecordIds = cfg.record_ids || [];
+    interval = cfg.update_interval || 300;
+    document.getElementById('intervalInput').value = interval;
+    renderDomains();
+    if (savedRecordIds.length > 0) {
+      showStatus();
+    }
+  } catch(e) {}
+}
+
+function renderDomains() {
+  const ul = document.getElementById('domainList');
+  ul.innerHTML = '';
+  domains.forEach((d, i) => {
+    ul.innerHTML += '<li>' + esc(d)
+      + ' <button class="btn btn-sm btn-red" onclick="removeDomain('+i+')">Entfernen</button></li>';
+  });
+}
+
+function addDomain() {
+  const inp = document.getElementById('domainInput');
+  const val = inp.value.trim().toLowerCase();
+  if (!val || domains.includes(val)) return;
+  domains.push(val);
+  inp.value = '';
+  renderDomains();
+}
+
+function removeDomain(i) {
+  domains.splice(i, 1);
+  renderDomains();
+}
+
 async function testConnection() {
+  if (domains.length === 0) {
+    showError('Bitte mindestens eine Domain hinzufuegen.');
+    return;
+  }
   const btn = document.getElementById('testBtn');
-  const result = document.getElementById('result');
-  const error = document.getElementById('error');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Verbinde mit KAS API...';
-  result.classList.remove('show');
-  error.classList.remove('show');
+  hideMessages();
+  document.getElementById('recordsCard').classList.add('hidden');
+
   try {
-    const resp = await fetch('/api/test', { method: 'POST' });
+    const resp = await fetch('/api/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ domains: domains })
+    });
     const data = await resp.json();
-    if (!resp.ok) {
-      throw new Error(data.error || 'Unbekannter Fehler');
-    }
+    if (!resp.ok) throw new Error(data.error || 'Unbekannter Fehler');
+
     document.getElementById('currentIp').textContent = data.current_ip;
+    records = data.records;
     const tbody = document.getElementById('recordsBody');
     tbody.innerHTML = '';
-    data.records.forEach(r => {
+    records.forEach(r => {
       const match = r.current_ip === data.current_ip;
       const badge = match
         ? '<span class="badge badge-ok">Aktuell</span>'
         : '<span class="badge badge-update">Update noetig</span>';
+      const checked = savedRecordIds.includes(r.record_id) ? 'checked' : '';
       tbody.innerHTML += '<tr>'
+        + '<td class="check-col"><input type="checkbox" value="'+esc(r.record_id)+'" '+checked+'></td>'
         + '<td>' + esc(r.name || '@') + '</td>'
         + '<td>' + esc(r.zone) + '</td>'
         + '<td style="font-family:monospace">' + esc(r.current_ip) + '</td>'
-        + '<td style="font-family:monospace;color:#94a3b8">' + esc(r.record_id) + '</td>'
         + '<td>' + badge + '</td></tr>';
     });
-    result.classList.add('show');
-  } catch (e) {
-    error.textContent = 'Fehler: ' + e.message;
-    error.classList.add('show');
+    document.getElementById('recordsCard').classList.remove('hidden');
+  } catch(e) {
+    showError(e.message);
   }
   btn.disabled = false;
-  btn.innerHTML = 'Verbindung testen';
+  btn.innerHTML = 'Verbindung testen &amp; A-Records laden';
+}
+
+async function saveSelection() {
+  const checks = document.querySelectorAll('#recordsBody input[type=checkbox]:checked');
+  const ids = Array.from(checks).map(c => c.value);
+  interval = parseInt(document.getElementById('intervalInput').value) || 300;
+
+  try {
+    const resp = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        domains: domains,
+        record_ids: ids,
+        update_interval: interval
+      })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Fehler beim Speichern');
+    savedRecordIds = ids;
+    showSuccess('Konfiguration gespeichert! DDNS Updater ist aktiv.');
+    showStatus();
+  } catch(e) {
+    showError(e.message);
+  }
+}
+
+function showStatus() {
+  const card = document.getElementById('statusCard');
+  const div = document.getElementById('activeRecords');
+  if (savedRecordIds.length === 0) {
+    card.classList.add('hidden');
+    return;
+  }
+  card.classList.remove('hidden');
+  let html = '<p class="section-label">Aktive Records (Update alle ' + interval + 's):</p>';
+  savedRecordIds.forEach(id => {
+    const r = records.find(x => x.record_id === id);
+    const label = r ? (r.name || '@') + '.' + r.zone : 'Record #' + id;
+    html += '<span class="badge badge-active" style="margin:2px">' + esc(label) + '</span> ';
+  });
+  div.innerHTML = html;
+}
+
+function showError(msg) {
+  const el = document.getElementById('error');
+  el.textContent = 'Fehler: ' + msg;
+  el.classList.add('show');
+}
+function showSuccess(msg) {
+  const el = document.getElementById('success');
+  el.textContent = msg;
+  el.classList.add('show');
+}
+function hideMessages() {
+  document.getElementById('error').classList.remove('show');
+  document.getElementById('success').classList.remove('show');
 }
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
 }
+
+loadConfig();
 </script>
 </body>
 </html>"""
@@ -167,7 +351,6 @@ function esc(s) {
 
 
 def get_public_ip() -> str:
-    """Get current public IPv4 address."""
     for service in IP_SERVICES:
         try:
             resp = requests.get(service, timeout=10)
@@ -181,7 +364,6 @@ def get_public_ip() -> str:
 
 
 def kas_auth(login: str, password: str) -> str:
-    """Authenticate with KAS API and get a session token."""
     auth_data = hashlib.sha1(password.encode()).hexdigest()
 
     soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -220,7 +402,6 @@ def kas_auth(login: str, password: str) -> str:
 
 
 def _parse_auth_token(xml_text: str) -> str:
-    """Extract credential token from KAS auth SOAP response."""
     root = ElementTree.fromstring(xml_text)
     for elem in root.iter():
         if elem.tag and "return" in elem.tag.lower():
@@ -242,7 +423,6 @@ def _parse_auth_token(xml_text: str) -> str:
 
 
 def kas_api_call(token: str, login: str, action: str, params: dict | None = None) -> str:
-    """Make a KAS API SOAP call using session token auth."""
     params_xml = ""
     if params:
         for key, value in params.items():
@@ -297,11 +477,11 @@ def kas_api_call(token: str, login: str, action: str, params: dict | None = None
 
 
 def parse_dns_records(xml_text: str) -> list[dict]:
-    """Parse DNS records from KAS API SOAP response."""
     records = []
     root = ElementTree.fromstring(xml_text)
 
     current_record = {}
+    key = None
     for elem in root.iter():
         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
 
@@ -309,7 +489,7 @@ def parse_dns_records(xml_text: str) -> list[dict]:
             key = elem.text.strip()
         elif tag == "value" and elem.text:
             value = elem.text.strip()
-            if "key" in dir() and key:
+            if key:
                 current_record[key] = value
                 if key == "record_aux":
                     records.append(current_record)
@@ -324,7 +504,6 @@ def parse_dns_records(xml_text: str) -> list[dict]:
 
 
 def _fallback_parse_records(xml_text: str) -> list[dict]:
-    """Fallback parser that extracts DNS records from SOAP response."""
     records = []
     root = ElementTree.fromstring(xml_text)
 
@@ -352,13 +531,11 @@ def _fallback_parse_records(xml_text: str) -> list[dict]:
 
 
 def get_dns_records(token: str, login: str, zone: str) -> list[dict]:
-    """Get all DNS records for a zone."""
     xml = kas_api_call(token, login, "get_dns_settings", {"zone_host": zone})
     return parse_dns_records(xml)
 
 
 def update_dns_record(token: str, login: str, record_id: str, new_ip: str) -> bool:
-    """Update a DNS record's data (IP address)."""
     xml = kas_api_call(
         token, login, "update_dns_settings",
         {"record_id": record_id, "record_data": new_ip},
@@ -374,19 +551,43 @@ def index():
     return HTML_PAGE
 
 
+@app.route("/api/config", methods=["GET"])
+def get_config():
+    return jsonify(load_config())
+
+
+@app.route("/api/config", methods=["POST"])
+def set_config():
+    data = flask_request.get_json()
+    if not data:
+        return jsonify({"error": "Keine Daten empfangen"}), 400
+
+    cfg = load_config()
+    if "domains" in data:
+        cfg["domains"] = [d.strip().lower() for d in data["domains"] if d.strip()]
+    if "record_ids" in data:
+        cfg["record_ids"] = data["record_ids"]
+    if "update_interval" in data:
+        cfg["update_interval"] = max(60, int(data["update_interval"]))
+
+    save_config(cfg)
+    log.info("Config saved: %s", cfg)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/test", methods=["POST"])
 def api_test():
-    """Test KAS connection and return DNS A-records."""
     login = os.environ.get("KAS_LOGIN")
     password = os.environ.get("KAS_PASSWORD")
-    domains = os.environ.get("KAS_DOMAINS", "")
 
     if not login or not password:
         return jsonify({"error": "KAS_LOGIN oder KAS_PASSWORD nicht konfiguriert"}), 500
-    if not domains:
-        return jsonify({"error": "KAS_DOMAINS nicht konfiguriert"}), 500
 
-    domain_list = [d.strip() for d in domains.split(",") if d.strip()]
+    data = flask_request.get_json() or {}
+    domain_list = data.get("domains", [])
+
+    if not domain_list:
+        return jsonify({"error": "Keine Domains angegeben"}), 400
 
     try:
         current_ip = get_public_ip()
@@ -430,18 +631,20 @@ def api_test():
 # ── DDNS Background Update Loop ─────────────────────────────────────────────
 
 def run_update():
-    """Main update logic."""
     login = os.environ.get("KAS_LOGIN")
     password = os.environ.get("KAS_PASSWORD")
-    domains = os.environ.get("KAS_DOMAINS", "")
-    record_names = os.environ.get("KAS_RECORD_NAMES", "")
 
-    if not login or not password or not domains:
-        log.error("Missing required env vars: KAS_LOGIN, KAS_PASSWORD, KAS_DOMAINS")
+    if not login or not password:
+        log.error("Missing required env vars: KAS_LOGIN, KAS_PASSWORD")
         return
 
-    domain_list = [d.strip() for d in domains.split(",") if d.strip()]
-    record_name_list = [r.strip() for r in record_names.split(",") if r.strip()] if record_names else []
+    cfg = load_config()
+    domain_list = cfg.get("domains", [])
+    record_ids = set(cfg.get("record_ids", []))
+
+    if not domain_list or not record_ids:
+        log.info("No domains or records configured yet - skipping update")
+        return
 
     current_ip = get_public_ip()
     log.info("Current public IP: %s", current_ip)
@@ -450,38 +653,26 @@ def run_update():
     token = kas_auth(login, password)
     log.info("Authentication successful")
 
+    seen_zones = set()
     for domain in domain_list:
         parts = domain.split(".")
         zone = ".".join(parts[-2:]) + "." if len(parts) >= 2 else domain + "."
 
-        log.info("Processing domain: %s (zone: %s)", domain, zone)
+        if zone in seen_zones:
+            continue
+        seen_zones.add(zone)
+
+        log.info("Processing zone: %s", zone)
         time.sleep(3)
 
         records = get_dns_records(token, login, zone)
-        log.info("Found %d DNS records for zone %s", len(records), zone)
 
-        updated = 0
         for record in records:
-            record_type = record.get("record_type", "")
+            record_id = record.get("record_id", "")
             record_name = record.get("record_name", "")
             record_data = record.get("record_data", "")
-            record_id = record.get("record_id", "")
 
-            if record_type != "A":
-                continue
-
-            should_update = False
-            if record_name_list:
-                if record_name in record_name_list:
-                    should_update = True
-            else:
-                full_name = record_name + zone if record_name else zone.rstrip(".")
-                for d in domain_list:
-                    if d.rstrip(".") in full_name or record_name == "" or record_name == domain.split(".")[0]:
-                        should_update = True
-                        break
-
-            if not should_update:
+            if record.get("record_type") != "A" or record_id not in record_ids:
                 continue
 
             if record_data == current_ip:
@@ -496,28 +687,22 @@ def run_update():
             success = update_dns_record(token, login, record_id, current_ip)
             if success:
                 log.info("  Successfully updated record %s", record_name or "@")
-                updated += 1
             else:
                 log.error("  Failed to update record %s", record_name or "@")
-
-        if updated == 0:
-            log.info("No records needed updating for %s", domain)
-        else:
-            log.info("Updated %d record(s) for %s", updated, domain)
 
     log.info("DDNS update cycle complete")
 
 
 def update_loop():
-    """Background thread: periodically runs DDNS updates."""
-    interval = int(os.environ.get("UPDATE_INTERVAL", "300"))
-    log.info("DDNS update loop started (interval: %ds)", interval)
-
     while True:
+        cfg = load_config()
+        interval = cfg.get("update_interval", 300)
+
         try:
             run_update()
         except Exception:
             log.exception("Error during update cycle")
+
         log.info("Next update in %d seconds...", interval)
         time.sleep(interval)
 
@@ -525,11 +710,9 @@ def update_loop():
 def main():
     log.info("KAS DDNS Updater starting")
 
-    # Start DDNS update loop in background thread
     t = threading.Thread(target=update_loop, daemon=True)
     t.start()
 
-    # Start Flask web server
     app.run(host="0.0.0.0", port=8000)
 
 

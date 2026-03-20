@@ -1,6 +1,6 @@
 services:
   kas-ddns-updater:
-    build: .
+    image: ghcr.io/iljabecker/kas-ddns-updater:latest
     container_name: kas-ddns-updater
     ports:
       - "8001:8000"
