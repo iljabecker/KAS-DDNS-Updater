@@ -2,12 +2,17 @@ services:
   kas-ddns-updater:
     build: .
     container_name: kas-ddns-updater
+    ports:
+      - "8001:8000"
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
+      - KAS_LOGIN=${KAS_LOGIN}
+      - KAS_PASSWORD=${KAS_PASSWORD}
+      - KAS_DOMAINS=${KAS_DOMAINS}
+      - KAS_RECORD_NAMES=${KAS_RECORD_NAMES:-}
+      - UPDATE_INTERVAL=${UPDATE_INTERVAL:-300}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=Europe/Berlin
-    # Optional: healthcheck via process running
     healthcheck:
       test: ["CMD", "pgrep", "-f", "ddns_updater"]
       interval: 60s

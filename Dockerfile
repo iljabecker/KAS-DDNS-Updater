@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ddns_updater.py .
 
+EXPOSE 8000
+
 # Run as non-root
 RUN useradd -r -s /bin/false ddns
 USER ddns

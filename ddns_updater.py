@@ -1,14 +1,15 @@
 """KAS DDNS Updater - Updates ALL-INKL DNS A-Records with current public IP."""
 
 import hashlib
-import json
 import logging
 import os
 import sys
+import threading
 import time
 from xml.etree import ElementTree
 
 import requests
+from flask import Flask, jsonify
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -28,6 +29,142 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
+app = Flask(__name__)
+
+# ── HTML Web UI ──────────────────────────────────────────────────────────────
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KAS DDNS Updater</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0f172a; color: #e2e8f0; min-height: 100vh;
+         display: flex; align-items: center; justify-content: center; }
+  .container { max-width: 720px; width: 100%; padding: 2rem; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+  .subtitle { color: #94a3b8; margin-bottom: 2rem; font-size: 0.9rem; }
+  .card { background: #1e293b; border-radius: 12px; padding: 1.5rem;
+          border: 1px solid #334155; margin-bottom: 1rem; }
+  .btn { background: #3b82f6; color: #fff; border: none; padding: 0.75rem 1.5rem;
+         border-radius: 8px; font-size: 1rem; cursor: pointer; width: 100%;
+         transition: background 0.2s; }
+  .btn:hover { background: #2563eb; }
+  .btn:disabled { background: #475569; cursor: not-allowed; }
+  .spinner { display: inline-block; width: 18px; height: 18px;
+             border: 2px solid #fff; border-top-color: transparent;
+             border-radius: 50%; animation: spin 0.8s linear infinite;
+             vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .result { margin-top: 1.5rem; display: none; }
+  .result.show { display: block; }
+  .ip-box { background: #0f172a; border-radius: 8px; padding: 1rem;
+            margin-bottom: 1rem; display: flex; justify-content: space-between;
+            align-items: center; }
+  .ip-label { color: #94a3b8; font-size: 0.85rem; }
+  .ip-value { font-family: monospace; font-size: 1.1rem; color: #22c55e; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+  th { text-align: left; padding: 0.6rem 0.75rem; color: #94a3b8;
+       font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;
+       border-bottom: 1px solid #334155; }
+  td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #1e293b;
+       font-size: 0.9rem; }
+  tr:hover td { background: #1e293b; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px;
+           font-size: 0.75rem; font-weight: 600; }
+  .badge-ok { background: #14532d; color: #4ade80; }
+  .badge-update { background: #7c2d12; color: #fb923c; }
+  .error { background: #7f1d1d; border: 1px solid #991b1b; border-radius: 8px;
+           padding: 1rem; color: #fca5a5; margin-top: 1rem; display: none; }
+  .error.show { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>KAS DDNS Updater</h1>
+  <p class="subtitle">Verbindung testen und DNS A-Records pruefen</p>
+  <div class="card">
+    <button class="btn" id="testBtn" onclick="testConnection()">
+      Verbindung testen
+    </button>
+  </div>
+  <div class="error" id="error"></div>
+  <div class="result" id="result">
+    <div class="card">
+      <div class="ip-box">
+        <div>
+          <div class="ip-label">Deine aktuelle oeffentliche IP</div>
+          <div class="ip-value" id="currentIp">—</div>
+        </div>
+      </div>
+      <h3 style="margin-bottom:0.5rem; font-size:1rem;">A-Records</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Record</th>
+            <th>Zone</th>
+            <th>Aktuelle IP</th>
+            <th>ID</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="recordsBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+async function testConnection() {
+  const btn = document.getElementById('testBtn');
+  const result = document.getElementById('result');
+  const error = document.getElementById('error');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Verbinde mit KAS API...';
+  result.classList.remove('show');
+  error.classList.remove('show');
+  try {
+    const resp = await fetch('/api/test', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Unbekannter Fehler');
+    }
+    document.getElementById('currentIp').textContent = data.current_ip;
+    const tbody = document.getElementById('recordsBody');
+    tbody.innerHTML = '';
+    data.records.forEach(r => {
+      const match = r.current_ip === data.current_ip;
+      const badge = match
+        ? '<span class="badge badge-ok">Aktuell</span>'
+        : '<span class="badge badge-update">Update noetig</span>';
+      tbody.innerHTML += '<tr>'
+        + '<td>' + esc(r.name || '@') + '</td>'
+        + '<td>' + esc(r.zone) + '</td>'
+        + '<td style="font-family:monospace">' + esc(r.current_ip) + '</td>'
+        + '<td style="font-family:monospace;color:#94a3b8">' + esc(r.record_id) + '</td>'
+        + '<td>' + badge + '</td></tr>';
+    });
+    result.classList.add('show');
+  } catch (e) {
+    error.textContent = 'Fehler: ' + e.message;
+    error.classList.add('show');
+  }
+  btn.disabled = false;
+  btn.innerHTML = 'Verbindung testen';
+}
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>"""
+
+# ── KAS API Functions ────────────────────────────────────────────────────────
+
 
 def get_public_ip() -> str:
     """Get current public IPv4 address."""
@@ -45,7 +182,6 @@ def get_public_ip() -> str:
 
 def kas_auth(login: str, password: str) -> str:
     """Authenticate with KAS API and get a session token."""
-    # KAS supports sha1 auth: kas_auth_type=sha1, kas_auth_data=sha1(password)
     auth_data = hashlib.sha1(password.encode()).hexdigest()
 
     soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -86,22 +222,18 @@ def kas_auth(login: str, password: str) -> str:
 def _parse_auth_token(xml_text: str) -> str:
     """Extract credential token from KAS auth SOAP response."""
     root = ElementTree.fromstring(xml_text)
-    # The token is in the return value of the SOAP response
     for elem in root.iter():
         if elem.tag and "return" in elem.tag.lower():
             if elem.text and len(elem.text) > 10:
                 return elem.text.strip()
-        # Also check for text content that looks like a token
         if elem.text and len(elem.text.strip()) > 20 and elem.text.strip().isalnum():
             return elem.text.strip()
 
-    # Fallback: search all text nodes
     all_text = []
     for elem in root.iter():
         if elem.text and elem.text.strip():
             all_text.append(elem.text.strip())
 
-    # The token is usually the longest alphanumeric string
     candidates = [t for t in all_text if len(t) > 20]
     if candidates:
         return max(candidates, key=len)
@@ -184,7 +316,6 @@ def parse_dns_records(xml_text: str) -> list[dict]:
                     current_record = {}
                 key = None
 
-    # Fallback: try to find records by looking for record_id patterns
     if not records:
         log.debug("Primary parsing found no records, trying fallback parser")
         records = _fallback_parse_records(xml_text)
@@ -197,7 +328,6 @@ def _fallback_parse_records(xml_text: str) -> list[dict]:
     records = []
     root = ElementTree.fromstring(xml_text)
 
-    # Collect all key-value pairs
     all_items = []
     for elem in root.iter():
         children = list(elem)
@@ -208,7 +338,6 @@ def _fallback_parse_records(xml_text: str) -> list[dict]:
                 v = children[1].text.strip() if children[1].text else ""
                 all_items.append((k, v))
 
-    # Group into records (each record starts with record_id)
     current = {}
     for k, v in all_items:
         if k == "record_id" and current:
@@ -238,47 +367,99 @@ def update_dns_record(token: str, login: str, record_id: str, new_ip: str) -> bo
     return "true" in xml.lower() or "fault" not in xml.lower()
 
 
+# ── Flask Routes ─────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return HTML_PAGE
+
+
+@app.route("/api/test", methods=["POST"])
+def api_test():
+    """Test KAS connection and return DNS A-records."""
+    login = os.environ.get("KAS_LOGIN")
+    password = os.environ.get("KAS_PASSWORD")
+    domains = os.environ.get("KAS_DOMAINS", "")
+
+    if not login or not password:
+        return jsonify({"error": "KAS_LOGIN oder KAS_PASSWORD nicht konfiguriert"}), 500
+    if not domains:
+        return jsonify({"error": "KAS_DOMAINS nicht konfiguriert"}), 500
+
+    domain_list = [d.strip() for d in domains.split(",") if d.strip()]
+
+    try:
+        current_ip = get_public_ip()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+
+    try:
+        token = kas_auth(login, password)
+    except Exception as e:
+        return jsonify({"error": f"KAS Authentifizierung fehlgeschlagen: {e}"}), 401
+
+    a_records = []
+    seen_zones = set()
+
+    for domain in domain_list:
+        parts = domain.split(".")
+        zone = ".".join(parts[-2:]) + "." if len(parts) >= 2 else domain + "."
+
+        if zone in seen_zones:
+            continue
+        seen_zones.add(zone)
+
+        try:
+            time.sleep(3)  # KAS flood protection
+            records = get_dns_records(token, login, zone)
+        except Exception as e:
+            return jsonify({"error": f"DNS-Records fuer {zone} konnten nicht geladen werden: {e}"}), 500
+
+        for record in records:
+            if record.get("record_type") == "A":
+                a_records.append({
+                    "name": record.get("record_name", ""),
+                    "zone": zone.rstrip("."),
+                    "current_ip": record.get("record_data", ""),
+                    "record_id": record.get("record_id", ""),
+                })
+
+    return jsonify({"current_ip": current_ip, "records": a_records})
+
+
+# ── DDNS Background Update Loop ─────────────────────────────────────────────
+
 def run_update():
     """Main update logic."""
     login = os.environ.get("KAS_LOGIN")
     password = os.environ.get("KAS_PASSWORD")
-    domains = os.environ.get("KAS_DOMAINS", "")  # comma-separated: "example.com,sub.example.com"
-    record_names = os.environ.get("KAS_RECORD_NAMES", "")  # optional: specific record names to update
+    domains = os.environ.get("KAS_DOMAINS", "")
+    record_names = os.environ.get("KAS_RECORD_NAMES", "")
 
     if not login or not password or not domains:
         log.error("Missing required env vars: KAS_LOGIN, KAS_PASSWORD, KAS_DOMAINS")
-        sys.exit(1)
+        return
 
     domain_list = [d.strip() for d in domains.split(",") if d.strip()]
     record_name_list = [r.strip() for r in record_names.split(",") if r.strip()] if record_names else []
 
-    # Get current public IP
     current_ip = get_public_ip()
     log.info("Current public IP: %s", current_ip)
 
-    # Authenticate
     log.info("Authenticating with KAS API as %s...", login)
     token = kas_auth(login, password)
     log.info("Authentication successful")
 
     for domain in domain_list:
-        # Extract zone (top-level domain)
         parts = domain.split(".")
-        if len(parts) >= 2:
-            zone = ".".join(parts[-2:]) + "."
-        else:
-            zone = domain + "."
+        zone = ".".join(parts[-2:]) + "." if len(parts) >= 2 else domain + "."
 
         log.info("Processing domain: %s (zone: %s)", domain, zone)
-
-        # Respect KAS flood protection
         time.sleep(3)
 
-        # Get current DNS records
         records = get_dns_records(token, login, zone)
         log.info("Found %d DNS records for zone %s", len(records), zone)
 
-        # Find matching A records
         updated = 0
         for record in records:
             record_type = record.get("record_type", "")
@@ -289,14 +470,11 @@ def run_update():
             if record_type != "A":
                 continue
 
-            # Check if this record matches what we want to update
             should_update = False
             if record_name_list:
-                # Only update specified record names
                 if record_name in record_name_list:
                     should_update = True
             else:
-                # Update all A records in the zone that belong to our domains
                 full_name = record_name + zone if record_name else zone.rstrip(".")
                 for d in domain_list:
                     if d.rstrip(".") in full_name or record_name == "" or record_name == domain.split(".")[0]:
@@ -314,7 +492,7 @@ def run_update():
             log.info("  Updating record %s (ID: %s): %s -> %s",
                      record_name or "@", record_id, record_data, current_ip)
 
-            time.sleep(3)  # KAS flood protection
+            time.sleep(3)
             success = update_dns_record(token, login, record_id, current_ip)
             if success:
                 log.info("  Successfully updated record %s", record_name or "@")
@@ -330,21 +508,29 @@ def run_update():
     log.info("DDNS update cycle complete")
 
 
-def main():
-    """Entry point with scheduling support."""
-    interval = int(os.environ.get("UPDATE_INTERVAL", "300"))  # default: 5 minutes
-
-    log.info("KAS DDNS Updater starting")
-    log.info("Update interval: %d seconds", interval)
+def update_loop():
+    """Background thread: periodically runs DDNS updates."""
+    interval = int(os.environ.get("UPDATE_INTERVAL", "300"))
+    log.info("DDNS update loop started (interval: %ds)", interval)
 
     while True:
         try:
             run_update()
         except Exception:
             log.exception("Error during update cycle")
-
         log.info("Next update in %d seconds...", interval)
         time.sleep(interval)
+
+
+def main():
+    log.info("KAS DDNS Updater starting")
+
+    # Start DDNS update loop in background thread
+    t = threading.Thread(target=update_loop, daemon=True)
+    t.start()
+
+    # Start Flask web server
+    app.run(host="0.0.0.0", port=8000)
 
 
 if __name__ == "__main__":
