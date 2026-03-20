@@ -189,6 +189,23 @@ HTML_PAGE = """<!DOCTYPE html>
     <h2>Status</h2>
     <div id="activeRecords"></div>
   </div>
+
+  <!-- Debug -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; cursor:pointer"
+         onclick="document.getElementById('debugContent').classList.toggle('hidden'); this.querySelector('span').textContent = document.getElementById('debugContent').classList.contains('hidden') ? '&#9654;' : '&#9660;'">
+      <h2 style="margin:0">Debug</h2>
+      <span style="color:#94a3b8">&#9654;</span>
+    </div>
+    <div id="debugContent" class="hidden" style="margin-top:1rem">
+      <button class="btn btn-full" id="debugBtn" onclick="runDebug()" style="background:#6366f1">
+        KAS API Raw Response laden
+      </button>
+      <pre id="debugOutput" style="margin-top:1rem; background:#0f172a; border-radius:8px;
+           padding:1rem; font-size:0.75rem; overflow-x:auto; max-height:500px;
+           overflow-y:auto; white-space:pre-wrap; word-break:break-all; display:none"></pre>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -335,6 +352,30 @@ function showSuccess(msg) {
 function hideMessages() {
   document.getElementById('error').classList.remove('show');
   document.getElementById('success').classList.remove('show');
+}
+
+async function runDebug() {
+  if (domains.length === 0) { showError('Bitte mindestens eine Domain hinzufuegen.'); return; }
+  const btn = document.getElementById('debugBtn');
+  const out = document.getElementById('debugOutput');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Lade Raw Response...';
+  out.style.display = 'none';
+  try {
+    const resp = await fetch('/api/debug', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ domain: domains[0] })
+    });
+    const data = await resp.json();
+    out.textContent = JSON.stringify(data, null, 2);
+    out.style.display = 'block';
+  } catch(e) {
+    out.textContent = 'Error: ' + e.message;
+    out.style.display = 'block';
+  }
+  btn.disabled = false;
+  btn.innerHTML = 'KAS API Raw Response laden';
 }
 function esc(s) {
   const d = document.createElement('div');
