@@ -532,7 +532,10 @@ def _fallback_parse_records(xml_text: str) -> list[dict]:
 
 def get_dns_records(token: str, login: str, zone: str) -> list[dict]:
     xml = kas_api_call(token, login, "get_dns_settings", {"zone_host": zone})
-    return parse_dns_records(xml)
+    log.info("Raw KAS DNS response (first 2000 chars): %s", xml[:2000])
+    records = parse_dns_records(xml)
+    log.info("Parsed %d records: %s", len(records), records)
+    return records
 
 
 def update_dns_record(token: str, login: str, record_id: str, new_ip: str) -> bool:
@@ -549,6 +552,28 @@ def update_dns_record(token: str, login: str, record_id: str, new_ip: str) -> bo
 @app.route("/")
 def index():
     return HTML_PAGE
+
+
+@app.route("/api/debug", methods=["POST"])
+def api_debug():
+    """Return raw KAS API response for debugging."""
+    login = os.environ.get("KAS_LOGIN")
+    password = os.environ.get("KAS_PASSWORD")
+    data = flask_request.get_json() or {}
+    domain = data.get("domain", "")
+
+    if not login or not password or not domain:
+        return jsonify({"error": "Missing login, password or domain"}), 400
+
+    try:
+        token = kas_auth(login, password)
+        parts = domain.split(".")
+        zone = ".".join(parts[-2:]) + "." if len(parts) >= 2 else domain + "."
+        time.sleep(3)
+        xml = kas_api_call(token, login, "get_dns_settings", {"zone_host": zone})
+        return jsonify({"zone": zone, "raw_xml": xml[:5000], "parsed": parse_dns_records(xml)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/config", methods=["GET"])
