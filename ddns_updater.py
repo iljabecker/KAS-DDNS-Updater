@@ -407,27 +407,25 @@ def get_public_ip() -> str:
 def kas_auth(login: str, password: str) -> str:
     auth_data = hashlib.sha1(password.encode()).hexdigest()
 
+    params_json = json.dumps({
+        "KasUser": login,
+        "KasAuthType": "sha1",
+        "KasAuthData": auth_data,
+    })
+
     soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <KasAuth xmlns="urn:xmethodsKasApi">
-      <Params>
-        <item>
-          <key>kas_login</key>
-          <value>{login}</value>
-        </item>
-        <item>
-          <key>kas_auth_type</key>
-          <value>sha1</value>
-        </item>
-        <item>
-          <key>kas_auth_data</key>
-          <value>{auth_data}</value>
-        </item>
-      </Params>
-    </KasAuth>
-  </soap:Body>
-</soap:Envelope>"""
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:ns1="urn:xmethodsKasApi"
+  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+  SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <SOAP-ENV:Body>
+    <ns1:KasAuth>
+      <Params xsi:type="xsd:string">{params_json}</Params>
+    </ns1:KasAuth>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
 
     resp = requests.post(
         KAS_AUTH_URL,
@@ -464,45 +462,27 @@ def _parse_auth_token(xml_text: str) -> str:
 
 
 def kas_api_call(token: str, login: str, action: str, params: dict | None = None) -> str:
-    params_xml = ""
-    if params:
-        for key, value in params.items():
-            params_xml += f"""
-          <item>
-            <key>{key}</key>
-            <value>{value}</value>
-          </item>"""
+    params_json = json.dumps({
+        "KasUser": login,
+        "KasAuthType": "session",
+        "KasAuthData": token,
+        "KasRequestType": action,
+        "KasRequestParams": params or {},
+    })
 
     soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <KasApi xmlns="urn:xmethodsKasApi">
-      <Params>
-        <item>
-          <key>kas_login</key>
-          <value>{login}</value>
-        </item>
-        <item>
-          <key>kas_auth_type</key>
-          <value>session</value>
-        </item>
-        <item>
-          <key>kas_auth_data</key>
-          <value>{token}</value>
-        </item>
-        <item>
-          <key>kas_action</key>
-          <value>{action}</value>
-        </item>
-        <item>
-          <key>kas_action_params</key>
-          <value>{params_xml}
-          </value>
-        </item>
-      </Params>
-    </KasApi>
-  </soap:Body>
-</soap:Envelope>"""
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:ns1="urn:xmethodsKasApi"
+  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+  SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <SOAP-ENV:Body>
+    <ns1:KasApi>
+      <Params xsi:type="xsd:string">{params_json}</Params>
+    </ns1:KasApi>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
 
     resp = requests.post(
         KAS_API_URL,
