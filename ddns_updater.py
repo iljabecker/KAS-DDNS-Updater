@@ -1,6 +1,5 @@
 """KAS DDNS Updater - Updates ALL-INKL DNS A-Records with current public IP."""
 
-import hashlib
 import json
 import logging
 import os
@@ -8,10 +7,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from xml.etree import ElementTree
-
 import requests
 from flask import Flask, jsonify, request as flask_request
+from zeep import Client as SoapClient
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -20,9 +18,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("kas-ddns")
 
-KAS_AUTH_URL = "https://kasapi.kasserver.com/soap/KasAuth.php"
-KAS_API_URL = "https://kasapi.kasserver.com/soap/KasApi.php"
-
 IP_SERVICES = [
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
@@ -30,7 +25,7 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/data/config.json"))
 
@@ -409,192 +404,82 @@ def get_public_ip() -> str:
     raise RuntimeError("Could not determine public IP from any service")
 
 
-def kas_auth(login: str, password: str) -> str:
-    # Try sha1 first, fall back to plain if disabled
-    for auth_type, auth_val in [
-        ("sha1", hashlib.sha1(password.encode()).hexdigest()),
-        ("plain", password),
-    ]:
-        token = _try_auth(login, auth_type, auth_val)
-        if token:
-            return token
-    raise RuntimeError("KAS authentication failed with both sha1 and plain")
+_api_client = None
 
 
-def _try_auth(login: str, auth_type: str, auth_data: str) -> str | None:
-    params_json = json.dumps({
-        "KasUser": login,
-        "KasAuthType": auth_type,
-        "KasAuthData": auth_data,
-        "SessionLifeTime": 300,
-        "SessionUpdateLifeTime": "Y",
-    })
-    # Escape for XML embedding
-    params_escaped = params_json.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-
-    soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:ns1="urn:xmethodsKasApi"
-  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
-  SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-  <SOAP-ENV:Body>
-    <ns1:KasAuth>
-      <Params xsi:type="xsd:string">{params_escaped}</Params>
-    </ns1:KasAuth>
-  </SOAP-ENV:Body>
-</SOAP-ENV:Envelope>"""
-
-    resp = requests.post(
-        KAS_AUTH_URL,
-        data=soap_body.encode("utf-8"),
-        headers={
-            "Content-Type": "text/xml; charset=utf-8",
-            "SOAPAction": "urn:xmethodsKasApi#KasAuth",
-        },
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        log.warning("Auth with %s failed: HTTP %d", auth_type, resp.status_code)
-        return None
-    if "Fault" in resp.text:
-        log.warning("Auth with %s failed: %s", auth_type, resp.text[:200])
-        return None
-    try:
-        return _parse_auth_token(resp.text)
-    except RuntimeError:
-        log.warning("Auth with %s: could not parse token", auth_type)
-        return None
+def _get_api_client():
+    global _api_client
+    if _api_client is None:
+        _api_client = SoapClient(wsdl="https://kasapi.kasserver.com/soap/wsdl/KasApi.wsdl")
+    return _api_client
 
 
-def _parse_auth_token(xml_text: str) -> str:
-    root = ElementTree.fromstring(xml_text)
-    for elem in root.iter():
-        if elem.tag and "return" in elem.tag.lower():
-            if elem.text and len(elem.text) > 10:
-                return elem.text.strip()
-        if elem.text and len(elem.text.strip()) > 20 and elem.text.strip().isalnum():
-            return elem.text.strip()
-
-    all_text = []
-    for elem in root.iter():
-        if elem.text and elem.text.strip():
-            all_text.append(elem.text.strip())
-
-    candidates = [t for t in all_text if len(t) > 20]
-    if candidates:
-        return max(candidates, key=len)
-
-    raise RuntimeError(f"Could not parse auth token from response: {xml_text[:500]}")
-
-
-def kas_api_call(token: str, login: str, action: str, params: dict | None = None) -> str:
-    params_json = json.dumps({
-        "KasUser": login,
-        "KasAuthType": "session",
-        "KasAuthData": token,
-        "KasRequestType": action,
+def kas_api_call(login: str, password: str, action: str, params: dict | None = None):
+    """Make a KAS API call with direct plain auth (no separate auth step)."""
+    client = _get_api_client()
+    request_params = json.dumps({
+        "kas_login": login,
+        "kas_auth_type": "plain",
+        "kas_auth_data": password,
+        "kas_action": action,
         "KasRequestParams": params or {},
     })
-    params_escaped = params_json.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-
-    soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:ns1="urn:xmethodsKasApi"
-  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
-  SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-  <SOAP-ENV:Body>
-    <ns1:KasApi>
-      <Params xsi:type="xsd:string">{params_escaped}</Params>
-    </ns1:KasApi>
-  </SOAP-ENV:Body>
-</SOAP-ENV:Envelope>"""
-
-    resp = requests.post(
-        KAS_API_URL,
-        data=soap_body.encode("utf-8"),
-        headers={
-            "Content-Type": "text/xml; charset=utf-8",
-            "SOAPAction": "urn:xmethodsKasApi#KasApi",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.text
+    return client.service.KasApi(request_params)
 
 
-def parse_dns_records(xml_text: str) -> list[dict]:
+def parse_zeep_response(response) -> list[dict]:
+    """Parse zeep SOAP response into list of dicts."""
     records = []
-    root = ElementTree.fromstring(xml_text)
+    try:
+        # zeep returns nested objects; convert to dicts
+        from zeep.helpers import serialize_object
+        data = serialize_object(response)
+        log.debug("Serialized response type: %s", type(data))
 
-    current_record = {}
-    key = None
-    for elem in root.iter():
-        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        # The response structure is typically:
+        # {'Response': {'KasFloodDelay': ..., 'ReturnInfo': [...]}}
+        # or similar nested structure
+        if isinstance(data, dict):
+            # Look for ReturnInfo or similar data key
+            for key in ("ReturnInfo", "return", "item"):
+                if key in data:
+                    data = data[key]
+                    break
 
-        if tag == "key" and elem.text:
-            key = elem.text.strip()
-        elif tag == "value" and elem.text:
-            value = elem.text.strip()
-            if key:
-                current_record[key] = value
-                if key == "record_aux":
-                    records.append(current_record)
-                    current_record = {}
-                key = None
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    records.append({k: str(v) for k, v in item.items() if v is not None})
+        elif isinstance(data, dict) and "ReturnInfo" in data:
+            for item in data["ReturnInfo"]:
+                if isinstance(item, dict):
+                    records.append({k: str(v) for k, v in item.items() if v is not None})
 
-    if not records:
-        log.debug("Primary parsing found no records, trying fallback parser")
-        records = _fallback_parse_records(xml_text)
+    except Exception as e:
+        log.error("Failed to parse zeep response: %s", e)
+        log.debug("Raw response: %s", response)
 
     return records
 
 
-def _fallback_parse_records(xml_text: str) -> list[dict]:
-    records = []
-    root = ElementTree.fromstring(xml_text)
-
-    all_items = []
-    for elem in root.iter():
-        children = list(elem)
-        if len(children) == 2:
-            tags = [c.tag.split("}")[-1] if "}" in c.tag else c.tag for c in children]
-            if tags == ["key", "value"]:
-                k = children[0].text.strip() if children[0].text else ""
-                v = children[1].text.strip() if children[1].text else ""
-                all_items.append((k, v))
-
-    current = {}
-    for k, v in all_items:
-        if k == "record_id" and current:
-            records.append(current)
-            current = {}
-        if k.startswith("record_") or k in ("zone_host",):
-            current[k] = v
-    if current and "record_id" in current:
-        records.append(current)
-
-    return records
-
-
-def get_dns_records(token: str, login: str, zone: str) -> list[dict]:
-    xml = kas_api_call(token, login, "get_dns_settings", {"zone_host": zone})
-    log.info("Raw KAS DNS response (first 2000 chars): %s", xml[:2000])
-    records = parse_dns_records(xml)
+def get_dns_records(login: str, password: str, zone: str) -> list[dict]:
+    response = kas_api_call(login, password, "get_dns_settings", {"zone_host": zone})
+    log.info("Raw KAS DNS response: %s", str(response)[:2000])
+    records = parse_zeep_response(response)
     log.info("Parsed %d records: %s", len(records), records)
     return records
 
 
-def update_dns_record(token: str, login: str, record_id: str, new_ip: str) -> bool:
-    xml = kas_api_call(
-        token, login, "update_dns_settings",
-        {"record_id": record_id, "record_data": new_ip},
-    )
-    log.debug("Update response: %s", xml[:500])
-    return "true" in xml.lower() or "fault" not in xml.lower()
+def update_dns_record(login: str, password: str, record_id: str, new_ip: str) -> bool:
+    try:
+        kas_api_call(
+            login, password, "update_dns_settings",
+            {"record_id": record_id, "record_data": new_ip},
+        )
+        return True
+    except Exception as e:
+        log.error("Update failed: %s", e)
+        return False
 
 
 # ── Flask Routes ─────────────────────────────────────────────────────────────
@@ -616,17 +501,18 @@ def api_debug():
         return jsonify({"error": "Missing login, password or domain"}), 400
 
     try:
-        token = kas_auth(login, password)
         parts = domain.split(".")
         zone = ".".join(parts[-2:]) + "." if len(parts) >= 2 else domain + "."
-        time.sleep(3)
-        xml = kas_api_call(token, login, "get_dns_settings", {"zone_host": zone})
+        response = kas_api_call(login, password, "get_dns_settings", {"zone_host": zone})
+
+        from zeep.helpers import serialize_object
+        raw = serialize_object(response)
+
         return jsonify({
             "zone": zone,
             "auth": "ok",
-            "token_preview": token[:10] + "...",
-            "raw_xml": xml[:5000],
-            "parsed": parse_dns_records(xml),
+            "raw_response": str(raw)[:5000],
+            "parsed": parse_zeep_response(response),
         })
     except Exception as e:
         import traceback
@@ -676,11 +562,6 @@ def api_test():
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
 
-    try:
-        token = kas_auth(login, password)
-    except Exception as e:
-        return jsonify({"error": f"KAS Authentifizierung fehlgeschlagen: {e}"}), 401
-
     a_records = []
     seen_zones = set()
 
@@ -694,7 +575,7 @@ def api_test():
 
         try:
             time.sleep(3)  # KAS flood protection
-            records = get_dns_records(token, login, zone)
+            records = get_dns_records(login, password, zone)
         except Exception as e:
             return jsonify({"error": f"DNS-Records fuer {zone} konnten nicht geladen werden: {e}"}), 500
 
@@ -731,10 +612,6 @@ def run_update():
     current_ip = get_public_ip()
     log.info("Current public IP: %s", current_ip)
 
-    log.info("Authenticating with KAS API as %s...", login)
-    token = kas_auth(login, password)
-    log.info("Authentication successful")
-
     seen_zones = set()
     for domain in domain_list:
         parts = domain.split(".")
@@ -747,7 +624,7 @@ def run_update():
         log.info("Processing zone: %s", zone)
         time.sleep(3)
 
-        records = get_dns_records(token, login, zone)
+        records = get_dns_records(login, password, zone)
 
         for record in records:
             record_id = record.get("record_id", "")
@@ -766,7 +643,7 @@ def run_update():
                      record_name or "@", record_id, record_data, current_ip)
 
             time.sleep(3)
-            success = update_dns_record(token, login, record_id, current_ip)
+            success = update_dns_record(login, password, record_id, current_ip)
             if success:
                 log.info("  Successfully updated record %s", record_name or "@")
             else:
