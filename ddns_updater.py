@@ -30,6 +30,8 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
+VERSION = "1.2.0"
+
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/data/config.json"))
 
 app = Flask(__name__)
@@ -126,7 +128,10 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-  <h1>KAS DDNS Updater</h1>
+  <div style="display:flex; justify-content:space-between; align-items:baseline">
+    <h1>KAS DDNS Updater</h1>
+    <span style="color:#475569; font-size:0.75rem; font-family:monospace">{{VERSION}}</span>
+  </div>
   <p class="subtitle">DNS A-Records automatisch aktualisieren</p>
 
   <div class="error" id="error"></div>
@@ -421,7 +426,11 @@ def _try_auth(login: str, auth_type: str, auth_data: str) -> str | None:
         "KasUser": login,
         "KasAuthType": auth_type,
         "KasAuthData": auth_data,
+        "SessionLifeTime": 300,
+        "SessionUpdateLifeTime": "Y",
     })
+    # Escape for XML embedding
+    params_escaped = params_json.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
     soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
@@ -432,7 +441,7 @@ def _try_auth(login: str, auth_type: str, auth_data: str) -> str | None:
   SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <SOAP-ENV:Body>
     <ns1:KasAuth>
-      <Params xsi:type="xsd:string">{params_json}</Params>
+      <Params xsi:type="xsd:string">{params_escaped}</Params>
     </ns1:KasAuth>
   </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>"""
@@ -488,6 +497,7 @@ def kas_api_call(token: str, login: str, action: str, params: dict | None = None
         "KasRequestType": action,
         "KasRequestParams": params or {},
     })
+    params_escaped = params_json.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
     soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
@@ -498,7 +508,7 @@ def kas_api_call(token: str, login: str, action: str, params: dict | None = None
   SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <SOAP-ENV:Body>
     <ns1:KasApi>
-      <Params xsi:type="xsd:string">{params_json}</Params>
+      <Params xsi:type="xsd:string">{params_escaped}</Params>
     </ns1:KasApi>
   </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>"""
@@ -591,7 +601,7 @@ def update_dns_record(token: str, login: str, record_id: str, new_ip: str) -> bo
 
 @app.route("/")
 def index():
-    return HTML_PAGE
+    return HTML_PAGE.replace("{{VERSION}}", f"v{VERSION}")
 
 
 @app.route("/api/debug", methods=["POST"])
