@@ -587,14 +587,53 @@ def api_debug():
         return jsonify({"error": "Missing login, password or domain"}), 400
 
     try:
-        token = kas_auth(login, password)
+        # Debug: show raw auth response too
+        auth_data = hashlib.sha1(password.encode()).hexdigest()
+        auth_params = json.dumps({
+            "KasUser": login,
+            "KasAuthType": "sha1",
+            "KasAuthData": auth_data,
+        })
+        auth_soap = f"""<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:ns1="urn:xmethodsKasApi"
+  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+  SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <SOAP-ENV:Body>
+    <ns1:KasAuth>
+      <Params xsi:type="xsd:string">{auth_params}</Params>
+    </ns1:KasAuth>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
+
+        auth_resp = requests.post(
+            KAS_AUTH_URL,
+            data=auth_soap.encode("utf-8"),
+            headers={
+                "Content-Type": "text/xml; charset=utf-8",
+                "SOAPAction": "urn:xmethodsKasApi#KasAuth",
+            },
+            timeout=30,
+        )
+        auth_xml = auth_resp.text
+        token = _parse_auth_token(auth_xml)
+
         parts = domain.split(".")
         zone = ".".join(parts[-2:]) + "." if len(parts) >= 2 else domain + "."
         time.sleep(3)
         xml = kas_api_call(token, login, "get_dns_settings", {"zone_host": zone})
-        return jsonify({"zone": zone, "raw_xml": xml[:5000], "parsed": parse_dns_records(xml)})
+        return jsonify({
+            "zone": zone,
+            "auth_raw": auth_xml[:3000],
+            "token_parsed": token[:20] + "..." if len(token) > 20 else token,
+            "raw_xml": xml[:5000],
+            "parsed": parse_dns_records(xml),
+        })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 @app.route("/api/config", methods=["GET"])
