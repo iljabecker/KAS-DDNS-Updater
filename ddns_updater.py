@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -28,7 +29,7 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/data/config.json"))
 
@@ -70,12 +71,77 @@ def add_log(level: str, message: str):
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text())
-    return {"domains": [], "record_ids": [], "record_labels": {}, "update_interval": 300}
+    return {"domains": [], "domain_accounts": {}, "record_ids": [], "record_labels": {}, "update_interval": 300}
 
 
 def save_config(cfg: dict):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+# ── KAS Accounts (from env) ──────────────────────────────────────────────────
+
+def load_accounts() -> list[dict]:
+    """Load all KAS accounts from environment variables.
+
+    Supported schemes (may be combined):
+      - Legacy single account: KAS_LOGIN / KAS_PASSWORD (+ optional KAS_LABEL)
+      - Numbered accounts:      KAS_LOGIN_N / KAS_PASSWORD_N (+ optional KAS_LABEL_N)
+
+    The account ``login`` is used as its stable id. Order: legacy first, then
+    numbered by their index. The first account acts as the default.
+    """
+    accounts: list[dict] = []
+    seen: set[str] = set()
+
+    def add(login: str | None, password: str | None, label: str | None):
+        if login and password and login not in seen:
+            accounts.append({"login": login, "password": password, "label": (label or login).strip() or login})
+            seen.add(login)
+
+    # Legacy single account
+    add(os.environ.get("KAS_LOGIN"), os.environ.get("KAS_PASSWORD"), os.environ.get("KAS_LABEL"))
+
+    # Numbered accounts — discover every KAS_LOGIN_N present in the environment
+    indices = sorted(
+        int(m.group(1))
+        for key in os.environ
+        if (m := re.fullmatch(r"KAS_LOGIN_(\d+)", key))
+    )
+    for i in indices:
+        add(
+            os.environ.get(f"KAS_LOGIN_{i}"),
+            os.environ.get(f"KAS_PASSWORD_{i}"),
+            os.environ.get(f"KAS_LABEL_{i}"),
+        )
+
+    return accounts
+
+
+def account_for_domain(cfg: dict, domain: str, accounts: list[dict]) -> dict | None:
+    """Resolve which account a domain belongs to, falling back to the first."""
+    login = cfg.get("domain_accounts", {}).get(domain)
+    if login:
+        acc = next((a for a in accounts if a["login"] == login), None)
+        if acc:
+            return acc
+    return accounts[0] if accounts else None
+
+
+def resolve_zones(cfg: dict, accounts: list[dict]) -> list[tuple[str, dict]]:
+    """Return (zone, account) pairs for all configured domains, deduped by zone."""
+    result: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+    for domain in cfg.get("domains", []):
+        zone = get_zone_for_domain(domain)
+        if zone in seen:
+            continue
+        acc = account_for_domain(cfg, domain, accounts)
+        if not acc:
+            continue
+        seen.add(zone)
+        result.append((zone, acc))
+    return result
 
 
 # ── HTML Web UI ──────────────────────────────────────────────────────────────
@@ -89,7 +155,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-         background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+         background: #0f172a; color: #e2e8f0; min-height: 100vh; overflow-x: hidden; }
   .container { max-width: 900px; margin: 0 auto; padding: 1.5rem; }
 
   /* Header */
@@ -153,18 +219,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
   @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Inputs */
-  .input-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .input-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
   input[type="text"], input[type="number"] {
     background: #0f172a; border: 1px solid #334155; color: #e2e8f0;
     padding: 0.6rem 0.75rem; border-radius: 8px; font-size: 0.9rem;
-    flex: 1; outline: none; }
+    flex: 1 1 160px; min-width: 0; outline: none; }
   input:focus { border-color: #3b82f6; }
+  select { background: #0f172a; border: 1px solid #334155; color: #e2e8f0;
+           padding: 0.6rem 0.5rem; border-radius: 8px; font-size: 0.85rem;
+           outline: none; cursor: pointer; }
+  select:focus { border-color: #3b82f6; }
+  .acct-select { flex: 0 0 auto; max-width: 200px; }
 
   /* Domain list */
   .domain-list { list-style: none; }
   .domain-list li { display: flex; align-items: center; justify-content: space-between;
-                    padding: 0.5rem 0.75rem; background: #0f172a; border-radius: 8px;
+                    gap: 0.5rem; padding: 0.5rem 0.75rem; background: #0f172a; border-radius: 8px;
                     margin-bottom: 0.5rem; font-family: monospace; font-size: 0.9rem; }
+  .domain-list .domain-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .domain-list .domain-actions { display: flex; align-items: center; gap: 0.5rem; }
+  .domain-list select { padding: 0.35rem 0.4rem; font-size: 0.8rem; }
 
   /* Interval row */
   .interval-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
@@ -172,7 +246,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .interval-row input { width: 100px; }
 
   /* Table */
-  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+  .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch;
+                margin-top: 0.5rem; }
+  table { width: 100%; border-collapse: collapse; }
+  .table-wrap table { min-width: 520px; }
   th { text-align: left; padding: 0.5rem 0.6rem; color: #94a3b8;
        font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
        border-bottom: 1px solid #334155; }
@@ -221,6 +298,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* No-data placeholder */
   .empty-state { text-align: center; padding: 3rem 1rem; color: #64748b; }
   .empty-state p { margin-top: 0.5rem; font-size: 0.9rem; }
+
+  /* Mobile */
+  @media (max-width: 600px) {
+    .container { padding: 1rem 0.75rem; }
+    .card { padding: 1rem; }
+    h1 { font-size: 1.25rem; }
+    .tabs { gap: 0; }
+    .tab { padding: 0.6rem 0.9rem; font-size: 0.85rem; }
+    .stats-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+    .acct-select { max-width: 100%; }
+    .btn-group .btn { flex: 1 1 auto; justify-content: center; }
+  }
 </style>
 </head>
 <body>
@@ -306,11 +395,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- Records Table -->
       <div class="card">
         <h2><span class="pulse" id="dashPulse"></span>Ueberwachte A-Records</h2>
+        <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th>Record</th>
               <th>Zone</th>
+              <th id="dashAcctHead" style="display:none">Konto</th>
               <th>DNS IP</th>
               <th>Soll IP</th>
               <th>Status</th>
@@ -319,6 +410,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </thead>
           <tbody id="dashRecordsBody"></tbody>
         </table>
+        </div>
       </div>
     </div>
   </div>
@@ -330,6 +422,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="input-row">
         <input type="text" id="domainInput" placeholder="z.B. example.de"
                onkeydown="if(event.key==='Enter')addDomain()">
+        <select id="domainAccountInput" class="acct-select" style="display:none"></select>
         <button class="btn btn-sm" onclick="addDomain()">Hinzufuegen</button>
       </div>
       <ul class="domain-list" id="domainList"></ul>
@@ -357,18 +450,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
       <p class="section-label">Waehle die Records, die automatisch aktualisiert werden sollen:</p>
+      <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th class="check-col"></th>
             <th>Record</th>
             <th>Zone</th>
+            <th id="recAcctHead" style="display:none">Konto</th>
             <th>Aktuelle IP</th>
             <th>Status</th>
           </tr>
         </thead>
         <tbody id="recordsBody"></tbody>
       </table>
+      </div>
       <div style="margin-top:1rem">
         <button class="btn btn-green btn-full" onclick="saveSelection()">
           Auswahl speichern &amp; DDNS aktivieren
@@ -396,6 +492,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 // ── State ──
 let domains = [];
+let domainAccounts = {};
+let accounts = [];
 let interval = 300;
 let records = [];
 let savedRecordIds = [];
@@ -420,6 +518,7 @@ function switchTab(tab) {
 
 // ── Init ──
 async function init() {
+  await loadAccounts();
   await loadConfig();
   await refreshStatus();
 
@@ -439,12 +538,30 @@ async function init() {
   if (['dashboard','records','logs'].includes(hash)) switchTab(hash);
 }
 
+// ── Accounts ──
+async function loadAccounts() {
+  try {
+    const resp = await fetch('/api/accounts');
+    const data = await resp.json();
+    accounts = data.accounts || [];
+  } catch(e) { accounts = []; }
+
+  const sel = document.getElementById('domainAccountInput');
+  if (sel) {
+    sel.innerHTML = accounts.map(a =>
+      '<option value="'+esc(a.login)+'">'+esc(a.label)+'</option>').join('');
+    // Only expose the account picker when there is a choice to make
+    sel.style.display = accounts.length > 1 ? '' : 'none';
+  }
+}
+
 // ── Config ──
 async function loadConfig() {
   try {
     const resp = await fetch('/api/config');
     const cfg = await resp.json();
     domains = cfg.domains || [];
+    domainAccounts = cfg.domain_accounts || {};
     savedRecordIds = cfg.record_ids || [];
     savedRecordLabels = cfg.record_labels || {};
     interval = cfg.update_interval || 300;
@@ -494,6 +611,8 @@ async function refreshStatus() {
     }
 
     // Records table
+    const showAcct = accounts.length > 1;
+    document.getElementById('dashAcctHead').style.display = showAcct ? '' : 'none';
     const tbody = document.getElementById('dashRecordsBody');
     tbody.innerHTML = '';
     for (const [id, r] of Object.entries(s.records_status)) {
@@ -508,6 +627,7 @@ async function refreshStatus() {
       tbody.innerHTML += '<tr>'
         + '<td>' + esc(r.name || '@') + '</td>'
         + '<td>' + esc(r.zone || '') + '</td>'
+        + (showAcct ? '<td>' + esc(r.account_label || '') + '</td>' : '')
         + '<td style="font-family:monospace">' + esc(r.dns_ip || '-') + '</td>'
         + '<td style="font-family:monospace">' + esc(s.current_ip || '-') + '</td>'
         + '<td>' + badge + '</td>'
@@ -569,8 +689,19 @@ function renderDomains() {
   const ul = document.getElementById('domainList');
   ul.innerHTML = '';
   domains.forEach((d, i) => {
-    ul.innerHTML += '<li>' + esc(d)
-      + ' <button class="btn btn-sm btn-red" onclick="removeDomain('+i+')">Entfernen</button></li>';
+    let acctPicker = '';
+    if (accounts.length > 1) {
+      const opts = accounts.map(a =>
+        '<option value="'+esc(a.login)+'"'+(domainAccounts[d]===a.login?' selected':'')+'>'
+        + esc(a.label) + '</option>').join('');
+      acctPicker = '<select onchange="setDomainAccount('+i+',this.value)">' + opts + '</select>';
+    }
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="domain-name">' + esc(d) + '</span>'
+      + '<span class="domain-actions">' + acctPicker
+      + '<button class="btn btn-sm btn-red" onclick="removeDomain('+i+')">Entfernen</button>'
+      + '</span>';
+    ul.appendChild(li);
   });
 }
 
@@ -579,13 +710,21 @@ function addDomain() {
   const val = inp.value.trim().toLowerCase();
   if (!val || domains.includes(val)) return;
   domains.push(val);
+  const sel = document.getElementById('domainAccountInput');
+  if (sel && sel.value) domainAccounts[val] = sel.value;
+  else if (accounts.length) domainAccounts[val] = accounts[0].login;
   inp.value = '';
   renderDomains();
 }
 
 function removeDomain(i) {
+  delete domainAccounts[domains[i]];
   domains.splice(i, 1);
   renderDomains();
+}
+
+function setDomainAccount(i, login) {
+  domainAccounts[domains[i]] = login;
 }
 
 async function testConnection() {
@@ -600,13 +739,15 @@ async function testConnection() {
     const resp = await fetch('/api/test', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ domains: domains })
+      body: JSON.stringify({ domains: domains, domain_accounts: domainAccounts })
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Unbekannter Fehler');
 
     document.getElementById('currentIp').textContent = data.current_ip;
     records = data.records;
+    const showAcct = accounts.length > 1;
+    document.getElementById('recAcctHead').style.display = showAcct ? '' : 'none';
     const tbody = document.getElementById('recordsBody');
     tbody.innerHTML = '';
     records.forEach(r => {
@@ -619,6 +760,7 @@ async function testConnection() {
         + '<td class="check-col"><input type="checkbox" value="'+esc(r.record_id)+'" '+checked+'></td>'
         + '<td>' + esc(r.name || '@') + '</td>'
         + '<td>' + esc(r.zone) + '</td>'
+        + (showAcct ? '<td>' + esc(r.account_label || '') + '</td>' : '')
         + '<td style="font-family:monospace">' + esc(r.current_ip) + '</td>'
         + '<td>' + badge + '</td></tr>';
     });
@@ -643,7 +785,7 @@ async function saveSelection() {
     const resp = await fetch('/api/config', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ domains, record_ids: ids, record_labels: labels, update_interval: interval })
+      body: JSON.stringify({ domains, domain_accounts: domainAccounts, record_ids: ids, record_labels: labels, update_interval: interval })
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Fehler beim Speichern');
@@ -848,6 +990,14 @@ def get_config():
     return jsonify(load_config())
 
 
+@app.route("/api/accounts", methods=["GET"])
+def api_accounts():
+    """Return configured KAS accounts (without passwords) for the UI."""
+    return jsonify({"accounts": [
+        {"login": a["login"], "label": a["label"]} for a in load_accounts()
+    ]})
+
+
 @app.route("/api/config", methods=["POST"])
 def set_config():
     data = flask_request.get_json()
@@ -857,6 +1007,13 @@ def set_config():
     cfg = load_config()
     if "domains" in data:
         cfg["domains"] = [d.strip().lower() for d in data["domains"] if d.strip()]
+    if "domain_accounts" in data:
+        valid_logins = {a["login"] for a in load_accounts()}
+        cfg["domain_accounts"] = {
+            d.strip().lower(): login
+            for d, login in data["domain_accounts"].items()
+            if d.strip() and login in valid_logins
+        }
     if "record_ids" in data:
         cfg["record_ids"] = data["record_ids"]
     if "record_labels" in data:
@@ -871,14 +1028,13 @@ def set_config():
 
 @app.route("/api/test", methods=["POST"])
 def api_test():
-    login = os.environ.get("KAS_LOGIN")
-    password = os.environ.get("KAS_PASSWORD")
-
-    if not login or not password:
-        return jsonify({"error": "KAS_LOGIN oder KAS_PASSWORD nicht konfiguriert"}), 500
+    accounts = load_accounts()
+    if not accounts:
+        return jsonify({"error": "Keine KAS-Konten konfiguriert (KAS_LOGIN/KAS_PASSWORD bzw. KAS_LOGIN_1 ...)"}), 500
 
     data = flask_request.get_json() or {}
     domain_list = data.get("domains", [])
+    domain_accounts = data.get("domain_accounts", {})
 
     if not domain_list:
         return jsonify({"error": "Keine Domains angegeben"}), 400
@@ -888,20 +1044,15 @@ def api_test():
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
 
+    tmp_cfg = {"domains": domain_list, "domain_accounts": domain_accounts}
     a_records = []
-    seen_zones = set()
 
-    for domain in domain_list:
-        zone = get_zone_for_domain(domain)
-        if zone in seen_zones:
-            continue
-        seen_zones.add(zone)
-
+    for zone, acc in resolve_zones(tmp_cfg, accounts):
         try:
             time.sleep(3)
-            records = get_dns_records(login, password, zone)
+            records = get_dns_records(acc["login"], acc["password"], zone)
         except Exception as e:
-            return jsonify({"error": f"DNS-Records fuer {zone} konnten nicht geladen werden: {e}"}), 500
+            return jsonify({"error": f"DNS-Records fuer {zone} ({acc['label']}) konnten nicht geladen werden: {e}"}), 500
 
         for record in records:
             if record.get("record_type") == "A":
@@ -910,6 +1061,8 @@ def api_test():
                     "zone": zone.rstrip("."),
                     "current_ip": record.get("record_data", ""),
                     "record_id": record.get("record_id", ""),
+                    "account": acc["login"],
+                    "account_label": acc["label"],
                 })
 
     add_log("info", f"Verbindungstest: {len(a_records)} A-Records gefunden")
@@ -926,22 +1079,19 @@ def api_status():
 @app.route("/api/check", methods=["POST"])
 def api_check():
     """Manual check - refresh record status without updating."""
-    login = os.environ.get("KAS_LOGIN")
-    password = os.environ.get("KAS_PASSWORD")
-
-    if not login or not password:
-        return jsonify({"error": "KAS Credentials fehlen"}), 500
+    accounts = load_accounts()
+    if not accounts:
+        return jsonify({"error": "Keine KAS-Konten konfiguriert"}), 500
 
     cfg = load_config()
     record_ids = set(cfg.get("record_ids", []))
-    record_labels = cfg.get("record_labels", {})
 
     if not record_ids:
         return jsonify({"error": "Keine Records konfiguriert"}), 400
 
     try:
         current_ip = get_public_ip()
-        _refresh_records_status(login, password, cfg, current_ip)
+        _refresh_records_status(accounts, cfg, current_ip)
         add_log("info", f"Manueller Check: IP ist {current_ip}")
 
         with state_lock:
@@ -958,11 +1108,9 @@ def api_check():
 @app.route("/api/update", methods=["POST"])
 def api_update():
     """Manual update - update all outdated records now."""
-    login = os.environ.get("KAS_LOGIN")
-    password = os.environ.get("KAS_PASSWORD")
-
-    if not login or not password:
-        return jsonify({"error": "KAS Credentials fehlen"}), 500
+    accounts = load_accounts()
+    if not accounts:
+        return jsonify({"error": "Keine KAS-Konten konfiguriert"}), 500
 
     cfg = load_config()
     record_ids = set(cfg.get("record_ids", []))
@@ -972,7 +1120,7 @@ def api_update():
 
     try:
         current_ip = get_public_ip()
-        updated, errors = _do_update(login, password, cfg, current_ip)
+        updated, errors = _do_update(accounts, cfg, current_ip)
         return jsonify({"message": f"{updated} aktualisiert, {errors} Fehler"})
     except Exception as e:
         add_log("error", f"Manuelles Update fehlgeschlagen: {e}")
@@ -996,27 +1144,20 @@ def api_logs():
 
 # ── Core Update Logic ────────────────────────────────────────────────────────
 
-def _refresh_records_status(login: str, password: str, cfg: dict, current_ip: str):
-    """Fetch current DNS state and update app_state."""
+def _refresh_records_status(accounts: list[dict], cfg: dict, current_ip: str):
+    """Fetch current DNS state (per account) and update app_state."""
     record_ids = set(cfg.get("record_ids", []))
     record_labels = cfg.get("record_labels", {})
-    domain_list = cfg.get("domains", [])
     now = datetime.now(timezone.utc).isoformat()
 
     new_status = {}
-    seen_zones = set()
 
-    for domain in domain_list:
-        zone = get_zone_for_domain(domain)
-        if zone in seen_zones:
-            continue
-        seen_zones.add(zone)
-
+    for zone, acc in resolve_zones(cfg, accounts):
         try:
             time.sleep(3)
-            records = get_dns_records(login, password, zone)
+            records = get_dns_records(acc["login"], acc["password"], zone)
         except Exception as e:
-            add_log("error", f"Fehler beim Laden von {zone}: {e}")
+            add_log("error", f"Fehler beim Laden von {zone} ({acc['label']}): {e}")
             # Mark all records of this zone as error
             for rid in record_ids:
                 label = record_labels.get(rid, "")
@@ -1027,6 +1168,8 @@ def _refresh_records_status(login: str, password: str, cfg: dict, current_ip: st
                         "dns_ip": "?",
                         "status": "error",
                         "last_updated": None,
+                        "login": acc["login"],
+                        "account_label": acc["label"],
                     }
             continue
 
@@ -1048,6 +1191,8 @@ def _refresh_records_status(login: str, password: str, cfg: dict, current_ip: st
                 "dns_ip": dns_ip,
                 "status": "ok" if dns_ip == current_ip else "outdated",
                 "last_updated": last_updated,
+                "login": acc["login"],
+                "account_label": acc["label"],
             }
 
     with state_lock:
@@ -1056,13 +1201,10 @@ def _refresh_records_status(login: str, password: str, cfg: dict, current_ip: st
         app_state["last_check"] = now
 
 
-def _do_update(login: str, password: str, cfg: dict, current_ip: str) -> tuple[int, int]:
+def _do_update(accounts: list[dict], cfg: dict, current_ip: str) -> tuple[int, int]:
     """Update all outdated records. Returns (updated_count, error_count)."""
-    record_ids = set(cfg.get("record_ids", []))
-    record_labels = cfg.get("record_labels", {})
-
     # First refresh status
-    _refresh_records_status(login, password, cfg, current_ip)
+    _refresh_records_status(accounts, cfg, current_ip)
 
     updated = 0
     errors = 0
@@ -1074,10 +1216,20 @@ def _do_update(login: str, password: str, cfg: dict, current_ip: str) -> tuple[i
 
     for rid, info in outdated.items():
         label = f"{info['name']}.{info['zone']}"
-        add_log("info", f"Aktualisiere {label}: {info['dns_ip']} -> {current_ip}")
+        acc = next((a for a in accounts if a["login"] == info.get("login")), None)
+        if not acc:
+            errors += 1
+            add_log("error", f"Kein Konto fuer {label} gefunden - uebersprungen")
+            with state_lock:
+                if rid in app_state["records_status"]:
+                    app_state["records_status"][rid]["status"] = "error"
+                app_state["error_count"] += 1
+            continue
+
+        add_log("info", f"Aktualisiere {label} ({acc['label']}): {info['dns_ip']} -> {current_ip}")
         time.sleep(3)
 
-        success = update_dns_record(login, password, rid, current_ip)
+        success = update_dns_record(acc["login"], acc["password"], rid, current_ip)
         if success:
             updated += 1
             add_log("success", f"{label} erfolgreich aktualisiert auf {current_ip}")
@@ -1102,11 +1254,10 @@ def _do_update(login: str, password: str, cfg: dict, current_ip: str) -> tuple[i
 # ── DDNS Background Update Loop ─────────────────────────────────────────────
 
 def run_update():
-    login = os.environ.get("KAS_LOGIN")
-    password = os.environ.get("KAS_PASSWORD")
+    accounts = load_accounts()
 
-    if not login or not password:
-        add_log("error", "KAS_LOGIN oder KAS_PASSWORD fehlt")
+    if not accounts:
+        add_log("error", "Keine KAS-Konten konfiguriert (KAS_LOGIN/KAS_PASSWORD bzw. KAS_LOGIN_1 ...)")
         return
 
     cfg = load_config()
@@ -1123,7 +1274,7 @@ def run_update():
         current_ip = get_public_ip()
         add_log("info", f"Aktuelle oeffentliche IP: {current_ip}")
 
-        updated, errors = _do_update(login, password, cfg, current_ip)
+        updated, errors = _do_update(accounts, cfg, current_ip)
 
         if updated > 0:
             add_log("success", f"Update-Zyklus abgeschlossen: {updated} aktualisiert, {errors} Fehler")

@@ -13,6 +13,7 @@ Dynamic DNS Updater for [ALL-INKL.COM](https://all-inkl.com/) (KAS API). Updates
 - **KAS SOAP API** with plain-text authentication
 - **Smart updates** — only when IP actually changed
 - **Multi-domain support** — monitor multiple zones at once
+- **Multi-account support** — manage multiple KAS accounts, assign each domain to its account
 - **KAS flood protection** compliance (3s delay between API calls)
 - **Docker-ready** for Portainer deployment
 - **Configurable update interval** via Web UI
@@ -46,6 +47,10 @@ services:
     environment:
       - KAS_LOGIN=${KAS_LOGIN}
       - KAS_PASSWORD=${KAS_PASSWORD}
+      # For a second account, add these too (see "Multiple KAS Accounts"):
+      # - KAS_LOGIN_2=${KAS_LOGIN_2}
+      # - KAS_PASSWORD_2=${KAS_PASSWORD_2}
+      # - KAS_LABEL_2=${KAS_LABEL_2}
       - TZ=Europe/Berlin
     volumes:
       - kas-ddns-data:/data
@@ -57,6 +62,7 @@ volumes:
 4. Add **Environment Variables** below the editor:
    - `KAS_LOGIN` = your KAS username (e.g. `w0123456`)
    - `KAS_PASSWORD` = your KAS password
+   - For multiple accounts, add `KAS_LOGIN_2`, `KAS_PASSWORD_2`, … (see [Multiple KAS Accounts](#multiple-kas-accounts))
 5. Click **Deploy the stack**
 6. Open `http://<your-server-ip>:8001`
 
@@ -74,7 +80,7 @@ docker compose up -d
 
 1. Open the Web UI at `http://<your-server-ip>:8001`
 2. Go to the **DNS Records** tab
-3. Add your domain(s) (e.g. `example.de`, `subdomain.example.de`)
+3. Add your domain(s) (e.g. `example.de`, `subdomain.example.de`) — if you configured more than one KAS account, pick the matching account per domain from the dropdown
 4. Click **"Verbindung testen & A-Records laden"**
 5. Select the A-Records you want to keep updated
 6. Click **"Auswahl speichern & DDNS aktivieren"**
@@ -84,13 +90,28 @@ docker compose up -d
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `KAS_LOGIN` | Yes | — | KAS username (e.g. `w0123456`) |
-| `KAS_PASSWORD` | Yes | — | KAS password |
+| `KAS_LOGIN` | Yes* | — | KAS username (e.g. `w0123456`) |
+| `KAS_PASSWORD` | Yes* | — | KAS password |
 | `TZ` | No | `UTC` | Timezone (e.g. `Europe/Berlin`) |
 | `LOG_LEVEL` | No | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `CONFIG_PATH` | No | `/data/config.json` | Path to config file |
 
-> **Note:** Domains and record selection are configured via the Web UI — no environment variables needed for that.
+\* At least one account is required — either `KAS_LOGIN`/`KAS_PASSWORD` or a numbered pair.
+
+### Multiple KAS Accounts
+
+To manage more than one KAS account, use **numbered** environment variables. You can add as many as you like:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `KAS_LOGIN_1` | — | KAS username of account 1 |
+| `KAS_PASSWORD_1` | — | KAS password of account 1 |
+| `KAS_LABEL_1` | No | Display name for account 1 in the Web UI (defaults to the login) |
+| `KAS_LOGIN_2` / `KAS_PASSWORD_2` / `KAS_LABEL_2` | — | Account 2 — and so on (`_3`, `_4`, …) |
+
+The legacy `KAS_LOGIN` / `KAS_PASSWORD` pair still works and simply counts as one more account. In the **DNS Records** tab you then pick, per domain, which account it belongs to (each DNS zone lives in exactly one KAS account).
+
+> **Note:** Domains, account assignment and record selection are configured via the Web UI — passwords stay in environment variables and are never written to the config volume.
 
 ## How It Works
 

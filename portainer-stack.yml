@@ -6,8 +6,16 @@ services:
       - "8001:8000"
     restart: unless-stopped
     environment:
+      # Single account:
       - KAS_LOGIN=${KAS_LOGIN}
       - KAS_PASSWORD=${KAS_PASSWORD}
+      # Multiple accounts (add as many numbered pairs as needed):
+      # - KAS_LOGIN_1=${KAS_LOGIN_1}
+      # - KAS_PASSWORD_1=${KAS_PASSWORD_1}
+      # - KAS_LABEL_1=${KAS_LABEL_1}
+      # - KAS_LOGIN_2=${KAS_LOGIN_2}
+      # - KAS_PASSWORD_2=${KAS_PASSWORD_2}
+      # - KAS_LABEL_2=${KAS_LABEL_2}
       - TZ=Europe/Berlin
     volumes:
       - kas-ddns-data:/data
