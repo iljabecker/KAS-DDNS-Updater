@@ -29,7 +29,7 @@ IP_SERVICES = [
     "https://checkip.amazonaws.com",
 ]
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/data/config.json"))
 
@@ -71,7 +71,7 @@ def add_log(level: str, message: str):
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text())
-    return {"domains": [], "domain_accounts": {}, "record_ids": [], "record_labels": {}, "update_interval": 300}
+    return {"domains": [], "zone_accounts": {}, "record_ids": [], "record_labels": {}, "update_interval": 300}
 
 
 def save_config(cfg: dict):
@@ -118,30 +118,44 @@ def load_accounts() -> list[dict]:
     return accounts
 
 
-def account_for_domain(cfg: dict, domain: str, accounts: list[dict]) -> dict | None:
-    """Resolve which account a domain belongs to, falling back to the first."""
-    login = cfg.get("domain_accounts", {}).get(domain)
-    if login:
-        acc = next((a for a in accounts if a["login"] == login), None)
-        if acc:
-            return acc
-    return accounts[0] if accounts else None
-
-
-def resolve_zones(cfg: dict, accounts: list[dict]) -> list[tuple[str, dict]]:
-    """Return (zone, account) pairs for all configured domains, deduped by zone."""
-    result: list[tuple[str, dict]] = []
+def unique_zones(cfg: dict) -> list[str]:
+    """Return the deduped list of zones for all configured domains."""
+    zones: list[str] = []
     seen: set[str] = set()
     for domain in cfg.get("domains", []):
         zone = get_zone_for_domain(domain)
-        if zone in seen:
+        if zone not in seen:
+            seen.add(zone)
+            zones.append(zone)
+    return zones
+
+
+def fetch_zone(zone: str, accounts: list[dict], zone_accounts: dict) -> tuple[dict | None, list[dict]]:
+    """Find which account owns a zone and return (account, records).
+
+    Tries the previously detected account first (fast path, single API call),
+    then falls back to probing the remaining accounts. The owning account is the
+    one whose ``get_dns_settings`` call returns records without a SOAP fault.
+    Returns (None, []) if no account owns the zone.
+    """
+    known = zone_accounts.get(zone.rstrip("."))
+    ordered = ([a for a in accounts if a["login"] == known]
+               + [a for a in accounts if a["login"] != known])
+
+    for acc in ordered:
+        try:
+            time.sleep(3)  # KAS flood protection
+            xml = kas_api_call(acc["login"], acc["password"], "get_dns_settings", {"zone_host": zone})
+        except Exception as e:
+            add_log("warning", f"{zone.rstrip('.')}: Abfrage bei {acc['label']} fehlgeschlagen: {e}")
             continue
-        acc = account_for_domain(cfg, domain, accounts)
-        if not acc:
+        if "Fault" in xml:
             continue
-        seen.add(zone)
-        result.append((zone, acc))
-    return result
+        records = parse_dns_records(xml)
+        if records:
+            return acc, records
+
+    return None, []
 
 
 # ── HTML Web UI ──────────────────────────────────────────────────────────────
@@ -422,7 +436,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="input-row">
         <input type="text" id="domainInput" placeholder="z.B. example.de"
                onkeydown="if(event.key==='Enter')addDomain()">
-        <select id="domainAccountInput" class="acct-select" style="display:none"></select>
         <button class="btn btn-sm" onclick="addDomain()">Hinzufuegen</button>
       </div>
       <ul class="domain-list" id="domainList"></ul>
@@ -492,7 +505,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 // ── State ──
 let domains = [];
-let domainAccounts = {};
+let zoneAccounts = {};
 let accounts = [];
 let interval = 300;
 let records = [];
@@ -545,14 +558,6 @@ async function loadAccounts() {
     const data = await resp.json();
     accounts = data.accounts || [];
   } catch(e) { accounts = []; }
-
-  const sel = document.getElementById('domainAccountInput');
-  if (sel) {
-    sel.innerHTML = accounts.map(a =>
-      '<option value="'+esc(a.login)+'">'+esc(a.label)+'</option>').join('');
-    // Only expose the account picker when there is a choice to make
-    sel.style.display = accounts.length > 1 ? '' : 'none';
-  }
 }
 
 // ── Config ──
@@ -561,7 +566,7 @@ async function loadConfig() {
     const resp = await fetch('/api/config');
     const cfg = await resp.json();
     domains = cfg.domains || [];
-    domainAccounts = cfg.domain_accounts || {};
+    zoneAccounts = cfg.zone_accounts || {};
     savedRecordIds = cfg.record_ids || [];
     savedRecordLabels = cfg.record_labels || {};
     interval = cfg.update_interval || 300;
@@ -689,16 +694,9 @@ function renderDomains() {
   const ul = document.getElementById('domainList');
   ul.innerHTML = '';
   domains.forEach((d, i) => {
-    let acctPicker = '';
-    if (accounts.length > 1) {
-      const opts = accounts.map(a =>
-        '<option value="'+esc(a.login)+'"'+(domainAccounts[d]===a.login?' selected':'')+'>'
-        + esc(a.label) + '</option>').join('');
-      acctPicker = '<select onchange="setDomainAccount('+i+',this.value)">' + opts + '</select>';
-    }
     const li = document.createElement('li');
     li.innerHTML = '<span class="domain-name">' + esc(d) + '</span>'
-      + '<span class="domain-actions">' + acctPicker
+      + '<span class="domain-actions">'
       + '<button class="btn btn-sm btn-red" onclick="removeDomain('+i+')">Entfernen</button>'
       + '</span>';
     ul.appendChild(li);
@@ -710,21 +708,13 @@ function addDomain() {
   const val = inp.value.trim().toLowerCase();
   if (!val || domains.includes(val)) return;
   domains.push(val);
-  const sel = document.getElementById('domainAccountInput');
-  if (sel && sel.value) domainAccounts[val] = sel.value;
-  else if (accounts.length) domainAccounts[val] = accounts[0].login;
   inp.value = '';
   renderDomains();
 }
 
 function removeDomain(i) {
-  delete domainAccounts[domains[i]];
   domains.splice(i, 1);
   renderDomains();
-}
-
-function setDomainAccount(i, login) {
-  domainAccounts[domains[i]] = login;
 }
 
 async function testConnection() {
@@ -739,13 +729,18 @@ async function testConnection() {
     const resp = await fetch('/api/test', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ domains: domains, domain_accounts: domainAccounts })
+      body: JSON.stringify({ domains: domains })
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Unbekannter Fehler');
 
     document.getElementById('currentIp').textContent = data.current_ip;
     records = data.records;
+    zoneAccounts = data.zone_accounts || {};
+    if (data.unmatched && data.unmatched.length) {
+      showError('Keine Zuordnung fuer: ' + data.unmatched.join(', ')
+        + ' - Zone gehoert zu keinem der konfigurierten Konten.');
+    }
     const showAcct = accounts.length > 1;
     document.getElementById('recAcctHead').style.display = showAcct ? '' : 'none';
     const tbody = document.getElementById('recordsBody');
@@ -785,7 +780,7 @@ async function saveSelection() {
     const resp = await fetch('/api/config', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ domains, domain_accounts: domainAccounts, record_ids: ids, record_labels: labels, update_interval: interval })
+      body: JSON.stringify({ domains, zone_accounts: zoneAccounts, record_ids: ids, record_labels: labels, update_interval: interval })
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Fehler beim Speichern');
@@ -954,12 +949,6 @@ def parse_dns_records(xml_text: str) -> list[dict]:
     return records
 
 
-def get_dns_records(login: str, password: str, zone: str) -> list[dict]:
-    xml = kas_api_call(login, password, "get_dns_settings", {"zone_host": zone})
-    records = parse_dns_records(xml)
-    return records
-
-
 def update_dns_record(login: str, password: str, record_id: str, new_ip: str) -> bool:
     try:
         xml = kas_api_call(
@@ -1007,12 +996,12 @@ def set_config():
     cfg = load_config()
     if "domains" in data:
         cfg["domains"] = [d.strip().lower() for d in data["domains"] if d.strip()]
-    if "domain_accounts" in data:
+    if "zone_accounts" in data:
         valid_logins = {a["login"] for a in load_accounts()}
-        cfg["domain_accounts"] = {
-            d.strip().lower(): login
-            for d, login in data["domain_accounts"].items()
-            if d.strip() and login in valid_logins
+        cfg["zone_accounts"] = {
+            z.strip().lower().rstrip("."): login
+            for z, login in data["zone_accounts"].items()
+            if z.strip() and login in valid_logins
         }
     if "record_ids" in data:
         cfg["record_ids"] = data["record_ids"]
@@ -1034,7 +1023,6 @@ def api_test():
 
     data = flask_request.get_json() or {}
     domain_list = data.get("domains", [])
-    domain_accounts = data.get("domain_accounts", {})
 
     if not domain_list:
         return jsonify({"error": "Keine Domains angegeben"}), 400
@@ -1044,16 +1032,19 @@ def api_test():
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
 
-    tmp_cfg = {"domains": domain_list, "domain_accounts": domain_accounts}
+    tmp_cfg = {"domains": domain_list}
     a_records = []
+    zone_accounts = {}
+    unmatched = []
 
-    for zone, acc in resolve_zones(tmp_cfg, accounts):
-        try:
-            time.sleep(3)
-            records = get_dns_records(acc["login"], acc["password"], zone)
-        except Exception as e:
-            return jsonify({"error": f"DNS-Records fuer {zone} ({acc['label']}) konnten nicht geladen werden: {e}"}), 500
+    # Auto-detect which account owns each zone by probing all accounts
+    for zone in unique_zones(tmp_cfg):
+        acc, records = fetch_zone(zone, accounts, zone_accounts)
+        if not acc:
+            unmatched.append(zone.rstrip("."))
+            continue
 
+        zone_accounts[zone.rstrip(".")] = acc["login"]
         for record in records:
             if record.get("record_type") == "A":
                 a_records.append({
@@ -1065,8 +1056,12 @@ def api_test():
                     "account_label": acc["label"],
                 })
 
-    add_log("info", f"Verbindungstest: {len(a_records)} A-Records gefunden")
-    return jsonify({"current_ip": current_ip, "records": a_records})
+    if unmatched:
+        add_log("warning", f"Keine Zuordnung fuer Zone(n): {', '.join(unmatched)}")
+
+    add_log("info", f"Verbindungstest: {len(a_records)} A-Records in {len(zone_accounts)} Zone(n) gefunden")
+    return jsonify({"current_ip": current_ip, "records": a_records,
+                    "zone_accounts": zone_accounts, "unmatched": unmatched})
 
 
 @app.route("/api/status", methods=["GET"])
@@ -1145,19 +1140,18 @@ def api_logs():
 # ── Core Update Logic ────────────────────────────────────────────────────────
 
 def _refresh_records_status(accounts: list[dict], cfg: dict, current_ip: str):
-    """Fetch current DNS state (per account) and update app_state."""
+    """Fetch current DNS state (auto-detecting the owning account) and update app_state."""
     record_ids = set(cfg.get("record_ids", []))
     record_labels = cfg.get("record_labels", {})
+    zone_accounts = cfg.get("zone_accounts", {})
     now = datetime.now(timezone.utc).isoformat()
 
     new_status = {}
 
-    for zone, acc in resolve_zones(cfg, accounts):
-        try:
-            time.sleep(3)
-            records = get_dns_records(acc["login"], acc["password"], zone)
-        except Exception as e:
-            add_log("error", f"Fehler beim Laden von {zone} ({acc['label']}): {e}")
+    for zone in unique_zones(cfg):
+        acc, records = fetch_zone(zone, accounts, zone_accounts)
+        if not acc:
+            add_log("error", f"Zone {zone.rstrip('.')} konnte keinem Konto zugeordnet werden")
             # Mark all records of this zone as error
             for rid in record_ids:
                 label = record_labels.get(rid, "")
@@ -1168,8 +1162,8 @@ def _refresh_records_status(accounts: list[dict], cfg: dict, current_ip: str):
                         "dns_ip": "?",
                         "status": "error",
                         "last_updated": None,
-                        "login": acc["login"],
-                        "account_label": acc["label"],
+                        "login": None,
+                        "account_label": "?",
                     }
             continue
 

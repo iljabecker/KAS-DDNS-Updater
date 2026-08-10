@@ -80,8 +80,8 @@ docker compose up -d
 
 1. Open the Web UI at `http://<your-server-ip>:8001`
 2. Go to the **DNS Records** tab
-3. Add your domain(s) (e.g. `example.de`, `subdomain.example.de`) — if you configured more than one KAS account, pick the matching account per domain from the dropdown
-4. Click **"Verbindung testen & A-Records laden"**
+3. Add your domain(s) (e.g. `example.de`, `subdomain.example.de`)
+4. Click **"Verbindung testen & A-Records laden"** — with multiple accounts, the app automatically finds which account owns each zone and shows it in the table
 5. Select the A-Records you want to keep updated
 6. Click **"Auswahl speichern & DDNS aktivieren"**
 7. Switch to the **Dashboard** tab to monitor
@@ -109,9 +109,9 @@ To manage more than one KAS account, use **numbered** environment variables. You
 | `KAS_LABEL_1` | No | Display name for account 1 in the Web UI (defaults to the login) |
 | `KAS_LOGIN_2` / `KAS_PASSWORD_2` / `KAS_LABEL_2` | — | Account 2 — and so on (`_3`, `_4`, …) |
 
-The legacy `KAS_LOGIN` / `KAS_PASSWORD` pair still works and simply counts as one more account. In the **DNS Records** tab you then pick, per domain, which account it belongs to (each DNS zone lives in exactly one KAS account).
+The legacy `KAS_LOGIN` / `KAS_PASSWORD` pair still works and simply counts as one more account. In the **DNS Records** tab you just add your domains — the app **auto-detects** which account each zone belongs to when you scan, and shows the matching account label in the table. No manual assignment needed.
 
-> **Note:** Domains, account assignment and record selection are configured via the Web UI — passwords stay in environment variables and are never written to the config volume.
+> **Note:** Domains and record selection are configured via the Web UI — passwords stay in environment variables and are never written to the config volume.
 
 ## How It Works
 
